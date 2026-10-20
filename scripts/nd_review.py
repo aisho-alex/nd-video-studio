@@ -16,10 +16,17 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from ndv_common import nd_chat  # noqa: E402
 
-ASK = """You review frames of an explainer video (grid of timestamped stills). {brief}
+ASK = """You review frames of an illustrated explainer video (grid of timestamped stills). {brief}
 For every frame with a problem write one line: "<timestamp>: <problem> → <fix>".
 Check: overlapping or clipped text, text too small to read on a phone, empty or confusing frames,
 captions covering the key visual, low contrast, elements outside safe margins.
+Also, now that the video carries generated illustrations:
+- a frame where the scene has no picture at all and no dense content to replace it (a bare text slide);
+- an illustration that shows a different subject than the scene is talking about;
+- a picture with garbled fake letters or numbers in it (image models invent text, it must not be visible);
+- a picture so dark or so bright that the text on it is unreadable, or the text sits on a busy part of it;
+- a picture that repeats the previous frame almost unchanged while the narration moved on;
+- a style break: one frame drawn in a visibly different palette or medium than its neighbours.
 Skip frames without problems. End with one line: VERDICT: ok | fix needed."""
 
 

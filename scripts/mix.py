@@ -5,6 +5,12 @@ Voice is normalized in voice_fx (−16 LUFS), music sits around −27 LUFS and d
 under the voice via a sidechain compressor. loudnorm resamples to 192 kHz internally and
 eats the tail, so it's always followed by aresample and a final apad to length.
 
+Every placed line is ramped at its own edges: the TTS clips stop mid-waveform, so without
+the ramps the seam between two lines is a step to silence — a click. voice_fx already fades
+each clip; doing it here too keeps the seam safe when mixing audio/fit directly.
+The music branch needs nothing: its 1.5 s fade-in starts at the atrim cut and its fade-out
+ends exactly on T.
+
   python3 scripts/mix.py projects/x/narration.json projects/x/audio/fx music.mp3 projects/x/audio/mix.wav
   python3 scripts/mix.py ... none projects/x/audio/mix.wav      # no music, voice only
 """
@@ -14,7 +20,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
-from ndv_common import clip_name, duration, ffmpeg, load_narration  # noqa: E402
+from ndv_common import FADE_IN, FADE_OUT, clip_name, duration, edge_fades, ffmpeg, load_narration  # noqa: E402
 
 
 def main():
@@ -26,6 +32,8 @@ def main():
     ap.add_argument("--music-lufs", type=float, default=-27)
     ap.add_argument("--music-offset", type=float, default=0, help="track start offset, seconds")
     ap.add_argument("--duck-ratio", type=float, default=6)
+    ap.add_argument("--fade-in", type=float, default=FADE_IN, help="line onset, seconds")
+    ap.add_argument("--fade-out", type=float, default=FADE_OUT, help="line offset, seconds")
     a = ap.parse_args()
 
     n = load_narration(a.narration)
@@ -40,7 +48,11 @@ def main():
     f = []
     for i, ln in enumerate(n["lines"]):
         ms = int(ln["start"] * 1000)
-        f.append(f"[{i + 1}:a]aresample=48000,aformat=channel_layouts=stereo,adelay={ms}|{ms},apad=whole_dur={T}[v{i}]")
+        clip = os.path.join(a.voice_dir, clip_name(i))
+        end = ln["start"] + duration(clip)          # ramps live on the padded stream, at the seam
+        ramps = edge_fades(dur=end, fin=a.fade_in, fout=a.fade_out, start=ln["start"])
+        f.append(f"[{i + 1}:a]aresample=48000,aformat=channel_layouts=stereo,adelay={ms}|{ms},"
+                 f"apad=whole_dur={T}{',' + ramps if ramps else ''}[v{i}]")
     k = len(n["lines"])
     f.append("".join(f"[v{i}]" for i in range(k)) + f"amix=inputs={k}:normalize=0:duration=longest,atrim=0:{T}[vo]")
     f.append("[vo]asplit=2[voa][sc]")
@@ -50,7 +62,9 @@ def main():
         f.append(f"[0:a]loudnorm=I={a.music_lufs}:TP=-6:LRA=11,aresample=48000,atrim={a.music_offset}:{a.music_offset + T},"
                  f"asetpts=N/SR/TB,afade=t=in:st=0:d=1.5,afade=t=out:st={T - 4}:d=4,apad=whole_dur={T}[mu]")
     f.append(f"[mu][sc]sidechaincompress=threshold=0.03:ratio={a.duck_ratio}:attack=30:release=500[duck]")
-    f.append(f"[duck][voa]amix=inputs=2:normalize=0:duration=longest,alimiter=limit=0.9,apad=whole_dur={T},atrim=0:{T}[out]")
+    tail = ",".join(x for x in (f"alimiter=limit=0.9", "apad=whole_dur=%g" % T,
+                                 edge_fades(dur=T, fin=0, fout=0.1), f"atrim=0:{T}") if x)
+    f.append(f"[duck][voa]amix=inputs=2:normalize=0:duration=longest,{tail}[out]")
     ffmpeg(*args, "-filter_complex", ";".join(f), "-map", "[out]", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", a.out)
     print(f"{a.out}: {duration(a.out):.2f}s (expected {T}s)")
 

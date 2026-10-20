@@ -5,6 +5,11 @@ Trims edge silence; if a line is too long, speeds it up with atempo (timbre
 is preserved). Going above --max-tempo is audible. Such lines are
 flagged TOO LONG: shorten them in narration.json and re-voice.
 
+start_silence is 0, not 0.05/0.1: it is the silence silenceremove KEEPS, so a positive
+value left ~20 ms of digital silence at the head of every clip — and a fade-in applied to
+silence fades nothing, the speech onset then steps in unrampe. Nothing to keep at the tail
+either: these engines stop mid-waveform, so the clip ends on the level, which is the click.
+
   python3 scripts/fit_narration.py projects/x/narration.json projects/x/audio/raw projects/x/audio/fit
 """
 
@@ -16,8 +21,8 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from ndv_common import clip_name, duration, ffmpeg, load_narration  # noqa: E402
 
-TRIM = ("silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.05,areverse,"
-        "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.1,areverse")
+TRIM = ("silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0,areverse,"
+        "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0,areverse")
 
 
 def main():

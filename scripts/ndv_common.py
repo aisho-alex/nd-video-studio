@@ -16,6 +16,8 @@ import urllib.request
 
 GAP = 0.35        # gap before the next line, seconds
 TAIL = 0.6        # margin at the end of the video after the last line, seconds
+FADE_IN = 0.015   # silence → speech edge, seconds
+FADE_OUT = 0.05   # speech → silence edge, seconds
 
 
 def http(url, body=None, headers=None, timeout=300):
@@ -63,6 +65,29 @@ def clip_name(i):
     return f"line_{i:02d}.wav"
 
 
+def edge_fades(dur=None, fin=FADE_IN, fout=FADE_OUT, start=0.0):
+    """Fade-in/fade-out filters that kill the click at a clip edge.
+
+    Every TTS engine cuts its clips hard: the file stops mid-waveform and some open on a
+    step. Measured on projects/latin-tutorial, the last 2 ms of a line sat 0.6 dB below
+    the level next to it — a full-level step to silence, one sample wide, i.e. a click,
+    loudest in the gap between lines. A ramp lands tens of dB lower. `audio_qc.py`
+    measures it and fails the build.
+
+    dur/start are in seconds from the head of the stream being filtered: on a line
+    already padded to the video length, start is the line's own start.
+    ffmpeg 6.1 rejects a negative `afade` st, so a tail without a known duration is
+    faded on a reversed stream (the same trick as fit_narration.TRIM).
+    """
+    out = []
+    if fin:
+        out.append(f"afade=t=in:st={start:g}:d={fin:g}")
+    if fout:
+        out.append(f"afade=t=out:st={dur - fout:g}:d={fout:g}" if dur is not None
+                   else f"areverse,afade=t=in:st=0:d={fout:g},areverse")
+    return ",".join(out)
+
+
 # ---- NeuralDeep API (api.neuraldeep.ru): everything the pipeline takes from the hub ----
 
 def nd_base():
@@ -74,7 +99,9 @@ def nd_auth():
 
 
 def _retry(call, attempts=4):
-    """Retry hub 429 and 5xx with backoff: a one-off gateway 503 shouldn't kill the whole pipeline."""
+    """Retry hub 429 and 5xx with backoff: a one-off gateway 503 shouldn't kill the whole pipeline.
+    The gateway does hand out whole minutes of 502 Bad Gateway on /v1/audio/speech — retry, don't
+    assume the payload is wrong."""
     import time
     import urllib.error
     for i in range(attempts):
@@ -86,6 +113,11 @@ def _retry(call, attempts=4):
             wait = float(e.headers.get("Retry-After") or 0) or 3 * (i + 1)
             print(f"  HTTP {e.code}, retrying in {wait:.0f} s")
             time.sleep(min(wait, 60))
+
+
+def retry(call, attempts=4):
+    """Public wrapper: the same backoff for callers that post audio or other binary bodies."""
+    return _retry(call, attempts)
 
 
 def nd_json(path, body=None, timeout=300):

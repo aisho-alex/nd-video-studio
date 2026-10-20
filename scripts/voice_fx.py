@@ -5,9 +5,15 @@ Reverb is afir with a synthetic impulse (pink noise with exponential decay),
 deterministic by seed, so renders are reproducible. Presets were tuned on the video
 Jev vs LLM (gpt-audio ash voice); "trailer" is what made the final cut.
 
+Every clip is faded at both edges, last in the chain, after loudnorm. The TTS engines stop
+mid-waveform: the last 2 ms of a line sat 0.6 dB below the level next to it — a step to
+silence, one sample wide, i.e. a click. Short ramps (15 ms in, 50–200 ms out by preset)
+remove it without sounding padded. `audio_qc.py` fails the build if an edge comes back hard.
+
   python3 scripts/voice_fx.py projects/x/audio/fit projects/x/audio/fx --preset trailer
   python3 scripts/voice_fx.py projects/x/audio/fit /tmp/ab --compare 0       # A/B of all presets
   python3 scripts/voice_fx.py ... --preset trailer --bass 7 --wet 0.25     # manual tweaking
+  python3 scripts/voice_fx.py ... --fade-in 0 --fade-out 0                 # raw edges (for A/B)
 """
 
 import argparse
@@ -16,7 +22,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
-from ndv_common import ffmpeg  # noqa: E402
+from ndv_common import edge_fades, ffmpeg  # noqa: E402
 
 PRESETS = {
     # bass: dB shelf at 110 Hz; presence: dB at 3 kHz; comp: ratio (0 = no compressor);
@@ -37,7 +43,7 @@ def make_ir(path, room, seed=7):
            "-af", f"afade=t=out:st=0:d={room}:curve=exp,lowpass=f=5500,highpass=f=200", "-ac", "2", path)
 
 
-def process(src, dst, p, ir):
+def process(src, dst, p, ir, fin, fout):
     chain = ["aresample=48000", "highpass=f=60"]
     if p["pitch"]:
         r = 2 ** (p["pitch"] / 12)            # lower pitch, same duration
@@ -53,13 +59,24 @@ def process(src, dst, p, ir):
         chain.append(f"acompressor=threshold=0.1:ratio={p['comp']}:attack=5:release=90:makeup=3")
     chain.append("aformat=channel_layouts=stereo")
     chain = ",".join(chain)
-    tail = "loudnorm=I=-16:TP=-1.5:LRA=7,aresample=48000"
+    # the fades come after loudnorm: the edge has to be ramped in final, absolute levels
+    tail = ",".join(x for x in ("loudnorm=I=-16:TP=-1.5:LRA=7,aresample=48000",
+                                edge_fades(fin=fin, fout=fout)) if x)
     if p["wet"] > 0 and ir:
         fc = (f"[0:a]{chain},asplit=2[dry][w];[w][1:a]afir=dry=0:wet=10:length=1[wet];"
               f"[dry][wet]amix=inputs=2:weights='1 {p['wet']}':normalize=0,{tail}[o]")
         ffmpeg("-i", src, "-i", ir, "-filter_complex", fc, "-map", "[o]", dst)
     else:
         ffmpeg("-i", src, "-af", f"{chain},{tail}", dst)
+
+
+def edge_seconds(p, fout_arg):
+    """Tail fade long enough to also let the reverb die; 50 ms unless the room is loud.
+
+    wet² because the tail is heard in proportion to the wet share, not to the room length:
+    trailer (1.4 s / 18%) gets 75 ms, cathedral (3.2 s / 45%) the 200 ms cap, natural 50 ms.
+    """
+    return fout_arg if fout_arg is not None else min(0.20, max(0.05, 0.03 + p["room"] * p["wet"] ** 2))
 
 
 def params(a, name):
@@ -76,6 +93,8 @@ def main():
     ap.add_argument("out_dir")
     ap.add_argument("--preset", default="trailer", choices=PRESETS)
     ap.add_argument("--compare", type=int, nargs="*", help="line numbers for an A/B file of all presets")
+    ap.add_argument("--fade-in", type=float, default=0.015, help="seconds, 0 = hard edge (clicks)")
+    ap.add_argument("--fade-out", type=float, help="seconds, default: enough for the reverb tail")
     for k in ("bass", "presence", "comp", "room", "wet", "pitch"):
         ap.add_argument(f"--{k}", type=float)
     a = ap.parse_args()
@@ -88,9 +107,10 @@ def main():
             ir = os.path.join(a.out_dir, f"ir_{name}.wav") if p["wet"] else None
             if ir:
                 make_ir(ir, p["room"])
+            fout = edge_seconds(p, a.fade_out)
             for i in a.compare:
                 out = os.path.join(a.out_dir, f"ab_{name}_{i:02d}.wav")
-                process(os.path.join(a.in_dir, f"line_{i:02d}.wav"), out, p, ir)
+                process(os.path.join(a.in_dir, f"line_{i:02d}.wav"), out, p, ir, a.fade_in, fout)
                 parts.append(out)
         # concatenate with pauses in preset order
         inputs = sum((["-i", x] for x in parts), [])
@@ -104,9 +124,10 @@ def main():
     ir = os.path.join(a.out_dir, "ir.wav") if p["wet"] else None
     if ir:
         make_ir(ir, p["room"])
+    fout = edge_seconds(p, a.fade_out)
     for src in sorted(glob.glob(os.path.join(a.in_dir, "line_*.wav"))):
-        process(src, os.path.join(a.out_dir, os.path.basename(src)), p, ir)
-    print(f"{a.preset} {p} → {a.out_dir}")
+        process(src, os.path.join(a.out_dir, os.path.basename(src)), p, ir, a.fade_in, fout)
+    print(f"{a.preset} {p} → {a.out_dir} (edges: in {a.fade_in * 1000:.0f} ms, out {fout * 1000:.0f} ms)")
 
 
 if __name__ == "__main__":

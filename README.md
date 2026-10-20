@@ -4,8 +4,9 @@ https://github.com/user-attachments/assets/751d01c0-2dc6-427d-b00d-ec5d7f2c0249
 
 # nd-video-studio
 
-Explainer videos in HTML: compositions in [HyperFrames](https://github.com/heygen-com/hyperframes)
-(Apache 2.0) → MP4, plus narrator, music and mixing on NeuralDeep infrastructure.
+Illustrated explainer videos in HTML: a storyboard, generated pictures, compositions in
+[HyperFrames](https://github.com/heygen-com/hyperframes) (Apache 2.0) → MP4, plus narrator, music
+and mixing on NeuralDeep infrastructure.
 The whole pipeline is described in the [`skills/nd-video/SKILL.md`](skills/nd-video/SKILL.md) skill,
 picked up by Claude Code (`.claude/skills`) and Codex/Cursor (`.agents/skills`).
 
@@ -20,13 +21,15 @@ subtitles, narrator with the `trailer` preset and ducked music.
 | path | what |
 |---|---|
 | `skills/nd-video/` | skill: from idea to MP4 (HyperFrames techniques, voice, music, mixing) |
-| `skills/ndt-content/` | skill: a video from a brief entirely on hub models (research, script, voice, images, checks, review) |
+| `skills/ndt-content/` | skill: a video from a brief entirely on hub models (research, storyboard, illustrations, voice, checks, review) |
 | `scripts/nd_probe.py` | availability check of every hub model and endpoint the pipeline uses |
 | `scripts/nd_research.py` | research via the hub Search API → `sources.md` |
-| `scripts/nd_script.py` | script by a hub model: brief + sources → `narration.json` with scenes |
+| `scripts/nd_storyboard.py` | the plan layer: brief + sources → `storyboard.json` (arc, lines, facts, one picture per scene); repairs language, thin and long plans by itself |
+| `scripts/nd_script.py` | that plan on a timeline → `narration.json` with scenes and lines |
+| `scripts/nd_compose.py` | `narration.json` + `words.json` + `assets/art.json` → `index.html` (5 layouts, word-level subtitles) |
 | `scripts/nd_retime.py` | line starts from the real voiceover, before laying out the HTML |
 | `scripts/nd_align.py` | `whisper-1`: voiceover vs text check and word timings `words.json` |
-| `scripts/nd_images.py` | hub FLUX images, background removal, upscale |
+| `scripts/nd_images.py` | hub FLUX images: one picture per scene in one style, cache, `assets/art.json`, `--scenes N` redraws one; ad-hoc mode keeps background removal and upscale |
 | `scripts/nd_review.py` | contact-sheet review by a hub vision model |
 | `scripts/music_studio.py` + `tools/music-studio.html` | local music studio on top of self-hosted ACE-Step: presets, variants, history, "to project" |
 | `scripts/beat_map.py` + `tools/beat-sync.js` | track beat map (beats, downbeats, hits) and binding animation to it, time warp |
@@ -37,7 +40,8 @@ subtitles, narrator with the `trailer` preset and ducked music.
 | `scripts/fit_narration.py` | sync: lines into timeline windows, silence trimming, atempo |
 | `scripts/voice_fx.py` | EQ, compression, convolution reverb; presets and A/B |
 | `scripts/mix.py` | voice and music mixed with ducking into one wav |
-| `scripts/build_audio.sh` | fit → fx → mix in one command |
+| `scripts/audio_qc.py` | click detector: level at every clip edge and line seam, fails the build |
+| `scripts/build_audio.sh` | fit → fx → mix → qc in one command |
 | `scripts/sync_hyperframes.sh` | update the vendored HyperFrames skills |
 | `vendor/hyperframes/` | vendored HyperFrames skills and docs + their LICENSE ([NOTICE](vendor/hyperframes/NOTICE.nd-video-studio)) |
 
@@ -46,7 +50,8 @@ subtitles, narrator with the `trailer` preset and ducked music.
 ```bash
 mkdir -p projects/my-video && cd projects/my-video    # projects/ are local, not tracked in git
 env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy -u ALL_PROXY npx -y hyperframes@0.8.81 init . --example blank
-# narration.json → voice (tts_hub.py) → build_audio.sh → render; step by step in skills/ndt-content/SKILL.md
+# brief → nd_research → nd_storyboard → nd_script → voice → nd_images → nd_compose → render;
+# step by step in skills/ndt-content/SKILL.md
 bash ../../scripts/build_audio.sh . trailer
 env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy -u ALL_PROXY npx -y hyperframes@0.8.81 render --output renders/my-video.mp4
 ```
