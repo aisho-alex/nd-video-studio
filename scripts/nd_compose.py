@@ -330,17 +330,22 @@ body {{ font-family: Inter, "Segoe UI", ui-sans-serif, system-ui, sans-serif; }}
 # ---------------------------------------------------------------- gsap
 
 def find_gsap(project_dir):
-    """assets/gsap.min.js: keep the project's own copy, else borrow one from a sibling project."""
+    """assets/gsap.min.js: своя копия, копия соседнего проекта, node_modules или сам пайплайн.
+
+    Последний источник — файл в корне этого репозитория: приложение раскладывает
+    проекты по своим каталогам, где ни соседей с готовым роликом, ни node_modules
+    нет, и композиция падала с «assets/gsap.min.js not found».
+    """
     dest = os.path.join(project_dir, "assets", "gsap.min.js")
     if os.path.exists(dest):
         return dest
-    for cand in sorted(glob.glob(os.path.join(project_dir, "..", "*", "assets", "gsap.min.js"))):
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        shutil.copyfile(cand, dest)
-        return dest
-    for cand in ("node_modules/gsap/dist/gsap.min.js",
-                 os.path.join(project_dir, "node_modules/gsap/dist/gsap.min.js")):
-        if os.path.exists(cand):
+    own = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "gsap.min.js")
+    sources = [own]
+    sources += sorted(glob.glob(os.path.join(project_dir, "..", "*", "assets", "gsap.min.js")))
+    sources += ["node_modules/gsap/dist/gsap.min.js",
+                os.path.join(project_dir, "node_modules", "gsap", "dist", "gsap.min.js")]
+    for cand in sources:
+        if cand and os.path.exists(cand):
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             shutil.copyfile(cand, dest)
             return dest
