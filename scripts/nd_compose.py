@@ -190,11 +190,14 @@ def scene_split(s, pic, lang, kicker, head=""):
     frame = (f'<div class="picframe"><img class="pic" src="{esc(bg)}" data-layout-ignore /></div>'
              if bg else '')
     solo = " cols--solo" if not bg else ""
+    # В f-строку подставляем готовый кусок: обратные слэши внутри выражения f-строки
+    # допустимы только начиная с Python 3.12, а образ ставит 3.11.
+    piccol = f'<div class="piccol">{frame}</div>' if frame else ''
     return (f'<div class="cam">{head}<div class="cols cols--split{solo}">'
             '<div class="textcol">'
             f'{kicker}<h2 class="heading">{esc(s["heading"])}</h2>'
             f'{facts_block(s.get("facts"), lang)}{keyidea_html(s.get("key_idea"), lang)}'
-            f'</div>{f"<div class=\"piccol\">{frame}</div>" if frame else ""}</div></div>')
+            f'</div>{piccol}</div></div>')
 
 
 def scene_data(s, pic, lang, kicker, head=""):
