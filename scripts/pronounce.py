@@ -45,8 +45,34 @@ LANGUAGES = {"ru": "Russian", "en": "English"}
 # ни «LLM», ни «rate limiting».
 WORD = re.compile(r"\w+", re.UNICODE)
 # Так выглядит слово после RUAccent: буквы, возможно с «+» перед ударной гласной.
-MARKED = re.compile(r"\w+(?:\+\w+)*", re.UNICODE)
+# Знак может стоять и перед словом («+Он»): без ведущего «+» в шаблоне он остаётся
+# снаружи и не вырезается, когда слово не омограф.
+MARKED = re.compile(r"\+?\w+(?:\+\w+)*", re.UNICODE)
 MAX_WORDS = 4       # максимум слов в одном ключе глоссария
+VOWELS = set("аеёиоуыэюяАЕЁИОУЫЭЮЯaeiouyAEIOUY")
+
+
+def stress_error(key, form):
+    """Почему форму с `+` нельзя отдавать движку, либо None.
+
+    Три проверки, каждая — из измеренного поведения ESpeech, а не из догадки:
+    `+` должен стоять перед ударной гласной (перед согласной движок читает слово как
+    другое: «за+мок» → «заумок»), стоять один, и форма должна быть тем же словом.
+    """
+    if not form or not key:
+        return "пустая форма"
+    if form.count("+") == 0:
+        return "в форме нет «+» — это не ручное ударение, а переписывание слова"
+    if form.count("+") > 1:
+        return "больше одного «+»"
+    pos = form.index("+")
+    if pos + 1 >= len(form):
+        return "«+» в конце формы"
+    if form[pos + 1] not in VOWELS:
+        return f"«+» перед «{form[pos + 1]}», а не перед гласной: движок прочитает слово иначе"
+    if form.replace("+", "").lower() != key.lower():
+        return f"форма «{form}» — не то же слово, что «{key}»"
+    return None
 
 # Латиница внутри русской реплики. Измерено на живом API: ESpeech глотает буквы,
 # «LLM» на выходе распознаётся как «ЭМ», а транслитерация «эл-эл-эм» — обратно как «LLM».
@@ -150,8 +176,18 @@ class Pronouncer:
         self.language = narration.get("language", "en")
         self.gloss = dict(GLOSS)
         self.gloss.update(v.get("pronounce") or {})
-        self.omographs = {}
         self.warnings = []
+        # Явные формы ударений проекта — единственный рычаг там, где RUAccent ошибся:
+        # на «Большая языковая модель» он даёт «Б+ольшая» (сравнительная степень), а нужно
+        # «больш+ая». Словарь омографов тут не помогает: дело не в омонимии.
+        self.stress = {}
+        for k, form in (v.get("stress") or {}).items():
+            err = stress_error(k, form)
+            if err:
+                self.warnings.append(f"voice.stress: «{k}» → «{form}» отброшено — {err}")
+            else:
+                self.stress[k.lower()] = form
+        self.omographs = {}
         self._acc = None
         if stress and self.language == "ru":
             self._load(model_size)
@@ -200,12 +236,16 @@ class Pronouncer:
 
         RUAccent отмечает ударение в каждом слове. Оставлять все отметки нельзя: движок,
         увидев `+`, перестаёт акцентировать сам, и мы отвечаем за каждое слово ролика.
+        Формы из voice.stress применяются после: это ручное решение поверх RUAccent.
         """
         marked = self._acc.process_all(text)
         omographs = self.omographs
 
         def repl(m):
             w = m.group(0)
+            override = self.stress.get(w.replace("+", "").lower())
+            if override:
+                return override if w[:1].isupper() else override.lower()
             return w if w.replace("+", "").lower() in omographs else w.replace("+", "")
 
         return MARKED.sub(repl, marked)
