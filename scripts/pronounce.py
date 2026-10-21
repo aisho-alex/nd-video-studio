@@ -299,7 +299,7 @@ def main():
     if report["stress"]:
         print(f"  ударений поставлено: {len(report['stress'])}")
         for x in report["stress"]:
-            print(f"    [{x['line']:2}] {x['word']} → {x['form']}")
+            print(f"    строка {x['line']:2}: {x['form']}")
     for w in p.warnings:
         print(f"  ⚠️  {w}")
     print("→", out)
