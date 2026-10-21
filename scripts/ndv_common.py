@@ -9,15 +9,23 @@ narration.json is the single source of narrator timings:
 A line's window = up to the next line's start minus the gap; the last one runs to the end of the video.
 """
 
+from array import array
 import json
+import math
 import os
 import subprocess
 import urllib.request
+import wave
 
 GAP = 0.35        # gap before the next line, seconds
 TAIL = 0.6        # margin at the end of the video after the last line, seconds
 FADE_IN = 0.015   # silence → speech edge, seconds
 FADE_OUT = 0.05   # speech → silence edge, seconds
+# Рампы шины (voice_bus.py) — короче: хвост реверберации теперь общий, и рамповать каждый
+# кусок по 15 мс незачем. audio_qc.py меряет край относительно участка ЗА рампой, поэтому
+# значения должны быть оттуда же.
+BUS_FADE_IN = 0.010
+BUS_FADE_OUT = 0.030
 
 
 def http(url, body=None, headers=None, timeout=300):
@@ -63,6 +71,120 @@ def env_key(*names):
 
 def clip_name(i):
     return f"line_{i:02d}.wav"
+
+
+def scene_name(i):
+    return f"scene_{i:02d}.wav"
+
+
+# ---- аудио в памяти: stdlib, потому что в образе нет ни numpy, ни scipy ----
+
+def wav_format(data):
+    """(частота, каналы) из байтов WAV: RIFF/WAVE, нужен только блок fmt."""
+    if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        raise ValueError("not a RIFF/WAVE")
+    pos = 12
+    while pos + 8 <= len(data):
+        cid, size = data[pos:pos + 4], int.from_bytes(data[pos + 4:pos + 8], "little")
+        if cid == b"fmt ":
+            return (int.from_bytes(data[pos + 12:pos + 14], "little"),
+                    int.from_bytes(data[pos + 10:pos + 12], "little"))
+        pos += 8 + size + (size & 1)
+    raise ValueError("no fmt chunk")
+
+
+def wav_sr(data):
+    return wav_format(data)[0]
+
+
+def wav_samples(data):
+    """Сэмплы int16 из WAV-байтов (PCM 16 bit). Стерео склеивается средним."""
+    sr, ch = wav_format(data)
+    pos, raw = 12, None
+    while pos + 8 <= len(data):
+        cid, size = data[pos:pos + 4], int.from_bytes(data[pos + 4:pos + 8], "little")
+        if cid == b"data":
+            raw = data[pos + 8:pos + 8 + size]
+            break
+        pos += 8 + size + (size & 1)
+    if raw is None:
+        raise ValueError("no data chunk")
+    s = array("h")
+    s.frombytes(raw[:len(raw) - len(raw) % 2])
+    if ch > 1:
+        s = array("h", [sum(s[i:i + ch]) // ch for i in range(0, len(s) - ch + 1, ch)])
+    return s, sr
+
+
+def read_wav(path):
+    """(сэмплы int16, частота, каналы). Каналы склеиваются средним."""
+    w = wave.open(path)
+    n, ch, sr = w.getnframes(), w.getnchannels(), w.getframerate()
+    s = array("h", w.readframes(n))
+    w.close()
+    if ch > 1:
+        s = array("h", [sum(s[i:i + ch]) // ch for i in range(0, len(s) - ch + 1, ch)])
+    return s, sr, ch
+
+
+def write_wav(path, samples, sr, ch=1):
+    w = wave.open(path, "wb")
+    w.setnchannels(ch)
+    w.setsampwidth(2)
+    w.setframerate(sr)
+    w.writeframes(samples if isinstance(samples, array) else array("h", samples))
+    w.close()
+
+
+ENV_WIN = 0.005      # окно RMS для поиска пауз, секунды
+ENV_REL = 0.02       # тишина — это уровень ниже 2% от пика за окно
+
+
+def envelope(samples, sr, win=ENV_WIN):
+    """RMS по окнам: список уровней. Один проход, без срезов на весь файл."""
+    n = max(1, int(win * sr))
+    out = []
+    for i in range(0, len(samples) - n + 1, n):
+        chunk = samples[i:i + n]
+        out.append(math.sqrt(sum(x * x for x in chunk) / n) / 32768.0)
+    if not out and samples:
+        out = [abs(samples[0]) / 32768.0]
+    return out
+
+
+def silence_spans(env, sr, minlen=0.10, rel=ENV_REL):
+    """Паузы как (начало, конец) в секундах: тихо относительно пика сигнала."""
+    if not env:
+        return []
+    peak = max(env) or 1.0
+    floor = peak * rel
+    step = ENV_WIN
+    out, i = [], 0
+    while i < len(env):
+        if env[i] <= floor:
+            j = i
+            while j < len(env) and env[j] <= floor:
+                j += 1
+            if (j - i) * step >= minlen:
+                out.append((round(i * step, 3), round(j * step, 3)))
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def trim_silence(samples, sr, rel=ENV_REL):
+    """Срезать тишину с обоих краёв, оставив один шаг окна."""
+    env = envelope(samples, sr)
+    if not env:
+        return samples
+    floor = (max(env) or 1.0) * rel
+    keep = [i for i, v in enumerate(env) if v > floor]
+    if not keep:
+        return samples
+    lo = int(keep[0] * ENV_WIN * sr)
+    hi = min(len(samples), int((keep[-1] + 1) * ENV_WIN * sr))
+    return samples[lo:hi]
 
 
 def edge_fades(dur=None, fin=FADE_IN, fout=FADE_OUT, start=0.0):
@@ -158,6 +280,54 @@ def nd_multipart(path, fields, files, timeout=300):
         with http(f"{nd_base()}{path}", body, {**nd_auth(), "Content-Type": ctype}, timeout) as r:
             return json.load(r)
     return _retry(call)
+
+
+def nd_speak(text, voice="ryan", language="English", style=None, speed=1.0,
+             model=None, seed=7, tries=5):
+    """Синтез речи хаба → (wav-байты, движок). Движок выбирается по языку: Russian → ESpeech
+    (F5 + RUAccent, ударения и омографы по контексту), остальное → Qwen3-TTS."""
+    import urllib.error
+    if model is None:
+        model = "espeech-tts" if language == "Russian" else "qwen3-tts"
+    body = {"model": model, "input": text, "voice": voice, "language": language,
+            "response_format": "wav", "speed": speed, "seed": seed}
+    if style:
+        body["instructions"] = style
+    key = env_key("ND_API_KEY")
+    base = os.environ.get("ND_API_BASE", "https://api.neuraldeep.ru")
+
+    def call():
+        with http(f"{base}/v1/audio/speech", body,
+                  {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}) as r:
+            data, engine = r.read(), r.headers.get("X-TTS-Engine") or r.headers.get("x-tts-engine") or "?"
+        if data[:4] != b"RIFF":
+            raise urllib.error.URLError(f"not audio: {data[:120]!r}")
+        return data, engine
+
+    return retry(call, tries)
+
+
+def nd_transcribe(audio, model="whisper-1", filename="clip.wav", timeout=600):
+    """Распознавание речи хаба.
+
+    Отправляются ТОЛЬКО `file` и `model`. Любое другое поле формы — `response_format`,
+    `language`, `timestamp_granularities` — даёт 400 «Invalid model name passed in
+    model=whisper-1», хотя модель в списке есть: сообщение врёт, и проверка речи падает
+    целиком. Ответ по умолчанию уже содержит segments[].words[] с таймингами слов,
+    поэтому ничего запрашивать не нужно.
+
+    Модели: whisper-1 — единственная с пригодными таймингами слов; gigaam-v3 таймингов
+    не отдаёт вовсе (годна как второй судья текста); whisper-podlodka-turbo дробит слова
+    на слоги.
+    """
+    res = nd_multipart("/v1/audio/transcriptions", {"model": model},
+                       {"file": (filename, audio, "audio/wav")}, timeout=timeout)
+    return {
+        "text": res.get("text", ""),
+        "words": [(w.get("word", "").strip(), w.get("start"), w.get("end"))
+                  for s in res.get("segments", []) for w in (s.get("words") or [])],
+        "duration": res.get("duration"),
+    }
 
 
 def extract_json(text):

@@ -17,7 +17,7 @@ instead of OpenRouter (gpt-audio, Lyria) and Gemini, only the hub and your own G
 | research | Search API (web, tg) | `/v1/search/web`, `/v1/search/tg` | `nd_research.py` |
 | storyboard | `qwen3.8-27b-noreason` (or `kimi-k2.6`, `gemma-4-31b-noreason`) | `/v1/chat/completions` | `nd_storyboard.py` |
 | script | same, but only when you skip the storyboard | `/v1/chat/completions` | `nd_script.py` |
-| voice | `qwen3-tts` (8 voices, style as text), Russian via ESpeech + RUAccent | `/v1/audio/speech` | `tts_hub.py` |
+| voice | `qwen3-tts` (8 voices, style as text), Russian via ESpeech + RUAccent | `/v1/audio/speech` | `nd_voice.py` |
 | timing | from the real voiceover length | — | `nd_retime.py`, `fit_narration.py` |
 | speech check + words | `whisper-1` | `/v1/audio/transcriptions` | `nd_align.py` |
 | images | FLUX, background removal, upscale | `/v1/images/*` | `nd_images.py` |
@@ -149,11 +149,27 @@ the HTML is already laid out to fixed starts (like the Jev video), skip retime: 
   `tts_hub.py` picks it from the language; the answer names the engine in the `X-TTS-Engine` header,
   which the script prints. Quota: `GET /v1/audio/quota` (characters of input text), voices:
   `GET /v1/audio/voices`, cap 5000 characters per call.
+- **`/v1/audio/transcriptions` принимает только `file` и `model`.** Любое другое поле формы
+  (`response_format`, `language`, `timestamp_granularities`) даёт
+  `400 Invalid model name passed in model=whisper-1`, хотя модель в списке есть: сообщение
+  врёт. Ответ по умолчанию уже содержит `segments[].words[]`, поэтому ничего запрашивать
+  не нужно. Тайминги слов даёт только `whisper-1`: `gigaam-v3` не отдаёт их вовсе,
+  `whisper-podlodka-turbo` дробит слова на слоги.
 - **ESpeech misreads Latin inside Russian text.** Caught by `nd_align.py` on a real run: "в запрос
-  к LLM" → «в запрос КМ», "RAG" → «Раджи». Rewriting the line fixes it ("к языковой модели");
-  voicing the same text again never will. `tts_hub.py` now warns about every line that mixes scripts
-  *before* spending the quota. The same trap is homographs: "а не на догадки" came out as
-  «они на догадки», so rephrase rather than retry.
+  к LLM" → «в запрос КМ», "RAG" → «Раджи». Словарь `voice.pronounce` чинит это без правки текста:
+  "LLM" → "эл-эл-эм", и whisper распознаёт обратно как "LLM", так что субтитры остаются
+  правильными. Переписывание реплики тоже работает, но стоит каждой строке отдельной правки.
+- **Похожесть текста — плохой критерий «слово не потерялось».** При `ratio` 0.86 строка
+  «Так у LLM появляются лапки» проходила, а на слух было «Так у ЛАЭМ появляются лапки».
+  `nd_align.py` сверяет пословно и требует, чтобы латинское слово текста выжило в
+  распознавании (своим написанием или речевой формой).
+- **Ударения ставит RUAccent, а не рукописный список.** «а+гент» — не «аг+ент», и это уже
+  другое слово; «Большая языковая модель» — `больш+ая`, а не `б+ольшая`. Знак `+` ставится
+  **перед ударной гласной**: перед согласной движок читает слово иначе (`за+мок` → «заумок»).
+  Ставится только в словах-омографах: как только `+` есть в тексте, авто-акцентиатор хаба
+  не вмешивается, и мы отвечаем за каждое слово. Формы проверяет `tts_probe.py --stress`.
+- **Ударение нельзя проверить автоматически.** Whisper его не слышит; F0 умеет лишь показать,
+  что знак встал на запрошенный слог. Эталон — словарь или ухо человека.
 - **TTS swallows and mixes up words**, easy to miss by ear: "reuse" came out as "ray use".
   `nd_align.py` compares the transcript with the text and exits with code 2 and an `--only N` list.
   Fix it by rephrasing the line, not by rerunning the same text.

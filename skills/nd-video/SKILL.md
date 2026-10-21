@@ -28,21 +28,24 @@ read it before writing the first line of HTML.
    the contact sheet yourself. `check` flags overlaps where the camera intentionally goes under
    overlays (subtitles, magnifier); those are false positives, trust the frames.
 5. **Narration text** in `projects/<slug>/narration.json` (`start` + `text`, windows are computed).
-6. **Voice** → `audio/raw/line_NN.wav`:
-   - `scripts/tts_gpt_audio.py`: OpenAI gpt-audio via OpenRouter, best delivery. Voice `ash`.
-   - `scripts/tts_hub.py`: the hub TTS. Russian → `espeech-tts` (F5 + RUAccent: correct stresses,
-     homograph disambiguation), everything else → Qwen3-TTS, 8 voices each. It retries the 429/5xx
-     the gateway hands out for minutes at a time, warns about lines that mix Latin into Russian
-     (ESpeech reads "LLM" as «КМ»), and prints the `X-TTS-Engine` that actually worked.
+6. **Voice** → `audio/raw/line_NN.wav` (и `audio/raw/scene_NN.wav`, из чего они нарезаны):
+   - `scripts/nd_voice.py`: **одна озвучка на сцену**, не на реплику. Текст сцены идёт в
+     движок целиком, whisper-1 даёт тайминги слов, `difflib` раскладывает слова по репликам,
+     граница берётся по середине ближайшей паузы. Реплики вырезаются в тишине — стык не
+     щёлкает по построению. Речевой текст готовит `pronounce.py`: латиница по словарю,
+     ударения омографов по RUAccent.
+   - `scripts/tts_hub.py` — старый путь «реплика на вызов». Оставлен для отладки; продом
+     больше не используется.
    - `scripts/tts_elevenlabs.py`: ElevenLabs `eleven_multilingual_v2`. The best Russian of the three;
      `voices` lists the account's voices, `speak` voices narration.json (neighbouring lines go as context).
 7. **Music** → `audio/music.mp3`:
    - `scripts/music_lyria.py`: Lyria 3 Pro, $0.08 per track.
    - `scripts/music_acestep.py`: self-hosted ACE-Step 1.5 (MIT), see `docs/acestep.md`.
 8. **Sound**: `scripts/build_audio.sh projects/<slug> trailer` = fit lines into windows
-   (`fit_narration.py`) → voice processing (`voice_fx.py`) → mix with ducking (`mix.py`)
-   → click check (`audio_qc.py`, fails the build). Every line is ramped in and out;
-   the composition has a single `<audio id="soundtrack" src="audio/mix.wav">` for the full length.
+   (`fit_narration.py`, темп общий на сцену) → voice bus (`voice_bus.py`: раскладка реплик
+   по таймлайну и **одна** реверберация/громкость/компрессор на весь ролик) → mix with ducking
+   (`mix.py`) → click check (`audio_qc.py`, fails the build). The composition has a single
+   `<audio id="soundtrack" src="audio/mix.wav">` for the full length.
 9. **Render**: `npx hyperframes render --output renders/<name>.mp4`; 112 s renders in ~1.5 min.
 10. **Compress for sharing**: `ffmpeg -i in.mp4 -c:v libx264 -preset slow -crf 30 -tune animation
    -pix_fmt yuv420p -c:a aac -b:a 96k -movflags +faststart out.mp4`. For the Jev video this took
@@ -63,34 +66,58 @@ Never print secrets or commit them (`.env` is in `.gitignore`).
 
 ## Voice: pitfalls
 
+- **Одна озвучка на сцену, а не на реплику** — главное правило звука. Тридцать шесть отдельных
+  высказываний дают тридцать шесть перезапусков комнаты, громкости и интонации, и стык реплик
+  слышен как щелчок. На уровне сэмплов там ничего нет: у всех клипов первый и последний отсчёт
+  равны нулю, QC показывал −44 dB. Щёлкали границы фраз, а не сигнал.
+- **Обработка голоса — общая на весь ролик** (`voice_bus.py`). Реверберация, loudnorm и
+  компрессор по одному разу на дорожку: иначе хвост реверберации обрезается на каждой
+  реплике, а каждая выравнивается по −16 LUFS отдельно.
+- **Рампы — на укладке, а не на краях кусков.** Края `audio/fit` жёсткие по построению,
+  `voice_bus.py` рампит их в момент раскладки (10 мс вход, 30 мс выход). Поэтому QC по краям
+  клипов идёт с `--report-only`, а гейтятся стыки в готовой дорожке.
+- **Гейт края меряется против участка ПОСЛЕ рампы** (`audio_qc.edges`, `BUS_FADE_IN`), а не
+  против пика онсента: иначе опорой служит взрывной согласный в начале слова и рампа в 10 мс
+  читается как −6 dB. Второй раз та же ошибка дала +9 dB: опорное окно считалось от начала
+  файла, а не от стыка.
+- **Темп общий на сцену** (`fit_narration.py`). Реплики вырезаны из одной записи, ужимать их
+  по-разному нельзя. Темп сцены = максимум по её репликам, в окне ×0.95…×1.12. Раньше темп
+  ограничивался только ускорением (>= 1.0), и реплика длиннее промежутка до следующей молча
+  наезжала на неё — а наложение двух фраз слышно как щелчок. Теперь это `TOO SHORT`.
+- **Тишина между репликами — не ноль, а комната.** Шумовая подложка −50 dBFS (`--room-tone-db`)
+  плюс `aresample=dither_method=triangular` перед 16-битным выходом. Цифровой ноль на паузе
+  делает любой стык заметным; QC гейтит паузу (`--min-gap`, по умолчанию −80 dBFS).
 - gpt-audio answers like an assistant ("Understood, here is…") and reads tags such as `<line>`
   aloud. Fix: a "you are a TTS engine" system prompt, bare text in the user turn, then transcribe
   the result, compare it with the text and retry (`tts_gpt_audio.py` does this).
 - OpenRouter audio output works only with `stream: true`; the format is `pcm16`, 24 kHz mono.
-- A line longer than its window: `fit_narration.py` speeds it up to ×1.12, beyond that it is
-  audible. `TOO LONG` = shorten the text and re-voice only that line: `--only N`.
-- Every engine stops its clips mid-waveform and some open on a step. Before the ramps, the last
-  2 ms of a line sat 0.6 dB below the level next to it — a full-level step to silence, one sample
-  wide, i.e. a click, loudest in the gap between lines. `voice_fx.py` now ramps both ends
-  (15 ms in, 50–200 ms out by preset) as the last step after `loudnorm`, and `mix.py` ramps them
-  again at the placement so the seam is safe even when mixing `audio/fit` directly. Don't bypass
-  either.
-- `fit_narration.py` trims with `start_silence=0`: that value is the silence silenceremove *keeps*,
-  so the old 0.05/0.1 left ~20 ms of digital silence at the head of every clip, and a fade-in
-  applied to silence fades nothing.
-- Processing presets (`voice_fx.py`): `natural` (no processing), `trailer` (final Jev mix: bass
-  +5 at 110 Hz, presence +2.5 at 3 kHz, 4:1 compression, 1.4 s / 18% reverb), `deep` (pitch
-  −2 semitones), `titan` (−4), `cathedral` (3.2 s / 45% reverb), `radio` (350–3400 Hz band).
-  Small EQ tweaks after loudnorm are barely audible (the first A/B sounded "like clones"), so the
-  presets are spread far apart. Fine-tune with flags: `--pitch -1 --bass 7 --wet 0.25 --room 2`.
-  Compare by ear: `voice_fx.py fit ab --compare 0`.
-
+- A line longer than its window: `fit_narration.py` speeds the whole scene up to ×1.12, beyond
+  that it is audible. `TOO LONG` = shorten the text and re-voice that scene: `--scenes N`.
 - ElevenLabs free tier: pcm output and library voices (native Russian speakers) are paid only
   (403 / 402), so the script takes mp3 and the premade voices work (Brian `nPczCjzI2devNBz1zQrb`
   was picked for Russian). 10 000 characters a month; a 90 s video is ~1 300. Reachable from RU IPs.
 - Hub TTS for Russian: `language` Russian goes to ESpeech, which answers 500 on words it doesn't
   know (terms, transliterated names); `Auto` goes to Qwen3-TTS, whose presets are not native
   Russian speakers and drift in timbre and emotion between lines.
+
+## Pronunciation and stress
+
+- **Латинский глоссарий** (`pronounce.py`, словарь в `voice.pronounce` + встроенный): ESpeech
+  глотает буквы — «LLM» распознаётся как «ЭМ», «rate limiting» как «Red Limiting». Замена
+  словарём работает: «эл-эл-эм» распознаётся обратно как «LLM», поэтому субтитры остаются
+  правильными, а `text` в narration.json — человеческим.
+- **Словарь подставляется по целым словам**, с учётом многословных ключей («rate limiting») и
+  дефисов («LLM-агент» → «эл-эл-эм-агент»). Токенизатор не решает, как читать аббревиатуру.
+- **Ударения ставит RUAccent**, не рукописный список: «Большая языковая модель» → `больш+ая
+  язык+овая`, и омограф снимается по контексту. Ставим `+` **только** в словах из
+  `omographs`: по документации хаба, как только `+` есть в тексте, авто-акцентиатор не
+  вмешивается, и отметив всё подряд мы взяли бы на себя риск за каждое слово ролика.
+- Знак `+` ставится **перед ударной гласной**. Перед согласной слово ломается: `за+мок`
+  произносится «заумок». Даже перед гласной не всегда: `а+гент` — «айгент». Поэтому формы
+  проверяются стендом (`tts_probe.py --stress`): синтез с `+` и без, распознавание обоих,
+  не выжил — откат.
+- Ударения **нельзя проверить автоматически**: whisper ударение не слышит, а F0 умеет лишь
+  показать, что знак встал на запрошенный слог. Эталон — словарь или ухо человека.
 
 ## Music: pitfalls
 
@@ -109,22 +136,30 @@ Never print secrets or commit them (`.env` is in `.gitignore`).
 
 ## Audio QC
 
-`build_audio.sh` ends with `audio_qc.py` on the clips and on the mixdown, and fails the build on a
-click. Run it by hand after touching the chain:
+`build_audio.sh` заканчивается `audio_qc.py` на миксе и роняет сборку на щелчке или на
+цифровой паузе. Отдельно (с `--report-only`) идёт отчёт по клипам. Запустить руками после
+правки цепочки:
 
 ```bash
-python3 scripts/audio_qc.py projects/<slug>/audio/fx                       # every clip
-python3 scripts/audio_qc.py projects/<slug>/audio/mix.wav --narration projects/<slug>/narration.json
+python3 scripts/audio_qc.py projects/<slug>/audio/fit --report-only
+python3 scripts/audio_qc.py projects/<slug>/audio/mix.wav --narration projects/<slug>/narration.json \
+    --clips projects/<slug>/audio/fit
 ```
 
-It prints the level of the first/last 2 ms against the peak of the 50 ms next to it. Near 0 dB means
-a step, one sample wide — a click. A ramp reads far below: the built projects are at −12…−46 dB,
-and anything above `--max-edge` (default −8) fails. Sample-level steps *inside* the audio are only
-a warning: a plosive in a word is indistinguishable from a click by level alone.
+Гейты: край у порога `--max-edge` (−8 dB) и пауза ниже `--min-gap` (−80 dBFS). Отчёт, не
+гейт: одиночные скачки внутри сигнала (`impulses` — у речи их много: плизивы и шипящие, и по
+уровню щелчок от шипящего не отличить) и разброс энергии (`liveness.spread_db`: ровная подача
+читается как «робот»).
 
-If it fails, check that `fit_narration` trimmed the leading silence and that neither `voice_fx` nor
-`mix.py` was run with `--fade-in 0 --fade-out 0`. A click in the middle of a word is not a seam
-problem — re-voice that line with `tts_hub.py --only N`.
+Замер края — это уровень первых 2 мс против того, что установилось ПОСЛЕ рампы. Правило
+неочевидное, но с пиком онсента опорой короткая рампа читается как щелчок.
+
+## Choosing a voice
+
+`scripts/tts_probe.py <narration> --voices --out /tmp/ab` синтезирует реплику всеми восемью
+голосами, склеивает в один файл с паузами и печатает длительность, тон и размах громкости.
+Слушать надо самому: тембр по цифрам не выбирается. `--stress` аудирует формы с `+`,
+`--lines N` озвучивает отдельную реплику.
 
 ## HyperFrames techniques proven on the video
 
