@@ -401,6 +401,10 @@ class Pronouncer:
                 "word": at[1] if at is not None else None,
                 "text": plain,
                 "form": form,
+                # Что выбрала библиотека. Когда форму меняли — это и прочтение,
+                # и выбор словаря, и по одному прочтению нельзя было бы понять,
+                # куда возвращать.
+                "library": tok,
                 "alternatives": [a for a in self.omographs.get(key, [])
                                  if a.lower() != form.lower()],
                 "source": source,
