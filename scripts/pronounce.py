@@ -342,7 +342,7 @@ class Pronouncer:
         for k, ln in enumerate(lines):
             manual = (ln.get("speech") or "").strip()
             text_k = manual if manual else (ln.get("text") or "").strip()
-            self._lines_present.add((scene, text_k))
+            self._lines_present.add((self._scene_of(ln, scene), text_k))
             if not text_k:
                 continue
             parts.append(text_k)
@@ -379,7 +379,8 @@ class Pronouncer:
             at = where.get(g)
             ov = None
             if at is not None:
-                ov = self.overrides.get((scene, (lines[at[0]].get("text") or "").strip()), {}).get(at[1])
+                sc = self._scene_of(lines[at[0]], scene)
+                ov = self.overrides.get((sc, (lines[at[0]].get("text") or "").strip()), {}).get(at[1])
                 seen.setdefault(at[0], set()).add(at[1])
             if key not in self.omographs:
                 # Не омограф: «+» убираем, иначе мы отвечали бы за ударение каждого
@@ -394,7 +395,8 @@ class Pronouncer:
                 continue
             form, source = tok, "library"
             if ov:
-                form, source = self._apply(scene, at[0], lines[at[0]], at[1], plain, tok, form)
+                form, source = self._apply(self._scene_of(lines[at[0]], scene), at[0],
+                                          lines[at[0]], at[1], plain, tok, form)
             out.append(form)
             occurrences.append({
                 "line": line_ids[at[0]] if at is not None else None,
@@ -413,7 +415,8 @@ class Pronouncer:
         # слов в строке, — их отмечаем отдельно, иначе они выглядят как «реплика
         # изменилась», а это другое.
         for k, line_text in ((k, (lines[k].get("text") or "").strip()) for k in seen):
-            for word, form in self.overrides.get((scene, line_text), {}).items():
+            sc = self._scene_of(lines[k], scene)
+            for word, form in self.overrides.get((sc, line_text), {}).items():
                 if word not in seen[k]:
                     self._orphan.append({"scene": scene, "line": k, "word": word, "form": form})
         return rebuild(marked, out), occurrences
@@ -423,6 +426,16 @@ class Pronouncer:
         if self.language == "ru":
             return gloss_with_map(text, self.gloss)
         return text, [[i] for i in range(len(WORD.findall(text)))]
+
+    def _scene_of(self, ln, fallback):
+        """Номер сцены из самой реплики.
+
+        Нумерация в отчёте идёт по порядку групп, а в нарративе у реплики стоит её
+        собственная сцена. Пока это одно и то же число, разницы нет; если разойдётся
+        — прочтение ищется по номеру реплики, а не по номеру группы.
+        """
+        v = ln.get("scene")
+        return v if isinstance(v, int) else fallback
 
     def _apply(self, scene, line_no, ln, word, plain, tok, form):
         """Ваше прочтение вместо библиотечного — если оно есть и выдержало проверку.
