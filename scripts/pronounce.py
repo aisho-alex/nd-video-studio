@@ -10,14 +10,25 @@
     "voice": {
       "voice": "uncle_fu",
       "style": "...",
-      "pronounce": {"LLM": "эл-эл-эм", "rate limiting": "рейт лимитинг"}
+      "pronounce": {"LLM": "эл-эл-эм", "rate limiting": "рейт лимитинг"},
+      "stress_occurrences": [
+        {"scene": 1, "line": "Большая языковая модель…", "word": 0, "form": "больш+ая"}
+      ]
     }
 
 `pronounce` — латиница и англицизмы, произносимые по-русски. Работает и проверено:
 whisper на «эл-эл-эм» пишет обратно «LLM», поэтому субтитры остаются правильными.
 
+`stress_occurrences` — ваши прочтения спорных мест, по вхождению, а не по слову.
+Внутри только то, что предлагает словарь омографов: слово «Большая» стоит в сцене 1
+в реплике «Большая языковая модель…», первое слово, читать как «больш+ая». Якорь —
+сцена, текст реплики и номер слова: индекс реплики сдвигается при удалении и переносе,
+а текст остаётся. Если текст реплики изменился, прочтение перестаёт применяться и
+показывается как устаревшее — молча применять его к другому слову нельзя.
+
 Ударения ставит не этот скрипт, а RUAccent — тот же акцентуатор, что работает внутри
-ESpeech на стороне хаба. Свои формы ударений здесь не выдумываются: «а+гент» вместо
+ESpeech на стороне хаба. Выбор прочтения — тоже его: этот скрипт не оценивает ударения
+и не спорит со словарём. Свои формы ударений здесь не выдумываются: «а+гент» вместо
 «аг+ент» — это ровно тот класс ошибок, который ломает реплику целиком.
 
 Важное правило: `+` ставится ТОЛЬКО в словах, которые RUAccent считает омографами. По
@@ -36,7 +47,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
-from ndv_common import load_narration  # noqa: E402
+from ndv_common import load_narration, scene_groups  # noqa: E402
 
 LANGUAGES = {"ru": "Russian", "en": "English"}
 
@@ -73,6 +84,35 @@ def stress_error(key, form):
     if form.replace("+", "").lower() != key.lower():
         return f"форма «{form}» — не то же слово, что «{key}»"
     return None
+
+def match_case(form, sample):
+    """Форма из словаря записана строчными, а слово в тексте может с заглавной.
+
+    «больш+ая» в начале предложения → «Больш+ая». Заглавной делается первая БУКВА, а не
+    первый символ: у формы «+один» знак «+» стоит впереди, и «+Один» читается иначе,
+    чем «+один».
+    """
+    if not sample[:1].isupper():
+        return form
+    out = list(form)
+    for i, ch in enumerate(out):
+        if ch.isalpha():
+            out[i] = ch.upper()
+            break
+    return "".join(out)
+
+
+def rebuild(text, tokens_out):
+    """Собрать текст заново из токенов: пробелы и знаки препинания — как были."""
+    parts, pos, k = [], 0, 0
+    for m in MARKED.finditer(text):
+        parts.append(text[pos:m.start()])
+        parts.append(tokens_out[k])
+        k += 1
+        pos = m.end()
+    parts.append(text[pos:])
+    return "".join(parts)
+
 
 # Латиница внутри русской реплики. Измерено на живом API: ESpeech глотает буквы,
 # «LLM» на выходе распознаётся как «ЭМ», а транслитерация «эл-эл-эм» — обратно как «LLM».
@@ -146,6 +186,46 @@ def latin_gloss(text, table):
     return "".join(out)
 
 
+def gloss_with_map(text, table):
+    """Подставить латиницу и вернуть карту «слово в тексте → слова в речи».
+
+    Нужна, чтобы ударение попало в то самое слово. «LLM» на экране произносится
+    «эл-эл-эм» — это три слова вместо одного, и после подстановки нумерация слов в
+    реплике едет. Карта: для каждого слова текста — индексы слов в произнесённом.
+    """
+    by_words = {tuple(k.lower().split()): v for k, v in table.items()}
+    toks = list(WORD.finditer(text))
+    out, pos, i = [], 0, 0
+    mapping = []          # для каждого слова текста: индексы слов в речи
+    spoken = 0            # сколько слов уже получилось в речи
+    while i < len(toks):
+        hit = False
+        for n in range(min(MAX_WORDS, len(toks) - i), 0, -1):
+            key = tuple(t.group(0).lower() for t in toks[i:i + n])
+            tail = toks[i + n].start() if i + n < len(toks) else len(text)
+            joined = n == 1 or not text[toks[i + n - 1].end():tail].strip()
+            if key in by_words and joined:
+                out.append(text[pos:toks[i].start()])
+                out.append(by_words[key])
+                pos = toks[i + n - 1].end()
+                words = WORD.findall(by_words[key])
+                # Первое слово замены забирает все новые слова, остальные — пусто:
+                # латиница в омографы не попадает, а нумерация дальше остаётся верной.
+                mapping.append(list(range(spoken, spoken + len(words))))
+                for _ in range(n - 1):
+                    mapping.append([])
+                spoken += len(words)
+                i += n
+                hit = True
+                break
+        if not hit:
+            mapping.append([spoken])
+            spoken += 1
+            i += 1
+    out.append(text[pos:])
+    return "".join(out), mapping
+
+
 def gloss_spans(text, table):
     """Что во что подставлено: [(слова как написаны, слова как произнесены)].
 
@@ -177,20 +257,39 @@ class Pronouncer:
         self.gloss = dict(GLOSS)
         self.gloss.update(v.get("pronounce") or {})
         self.warnings = []
-        # Явные формы ударений проекта — единственный рычаг там, где RUAccent ошибся:
-        # на «Большая языковая модель» он даёт «Б+ольшая» (сравнительная степень), а нужно
-        # «больш+ая». Словарь омографов тут не помогает: дело не в омонимии.
-        self.stress = {}
-        for k, form in (v.get("stress") or {}).items():
-            err = stress_error(k, form)
-            if err:
-                self.warnings.append(f"voice.stress: «{k}» → «{form}» отброшено — {err}")
-            else:
-                self.stress[k.lower()] = form
+        # Ваши прочтения: (сцена, текст реплики) → {номер слова: форма}.
+        self.overrides = {}
         self.omographs = {}
         self._acc = None
+        self._used = set()
+        self._lines_present = set()
+        self._rejected = []
+        self._orphan = []
         if stress and self.language == "ru":
             self._load(model_size)
+        self._load_overrides(v)
+
+    def _load_overrides(self, v):
+        """Прочтения из narration.json — по вхождению.
+
+        Слово как таковое не годится: «большая» встречается в ролике несколько раз, и
+        прочтение может зависеть от окружения. Зато индекс реплики сдвигается при
+        удалении и переносе, поэтому якорь — сцена, ТЕКСТ реплики и номер слова.
+        """
+        if v.get("stress"):
+            self.warnings.append("voice.stress больше не действует: прочтение задаётся "
+                                 "по вхождению — voice.stress_occurrences")
+        for o in (v.get("stress_occurrences") or []):
+            if not isinstance(o, dict):
+                continue
+            scene, line = o.get("scene"), o.get("line")
+            word, form = o.get("word"), o.get("form")
+            if (not isinstance(scene, int) or not isinstance(word, int)
+                    or not isinstance(line, str) or not isinstance(form, str)):
+                self.warnings.append("voice.stress_occurrences: запись без сцены, реплики, "
+                                     "номера слова или формы — отброшена")
+                continue
+            self.overrides.setdefault((scene, line.strip()), {})[word] = form.strip()
 
     def _load(self, model_size):
         try:
@@ -223,51 +322,189 @@ class Pronouncer:
         return self._mark_omographs(out) if use else out
 
     def scene(self, lines, stress=True):
-        """Текст сцены одной строкой: одна озвучка — один вызов движка.
+        """Текст сцены одной строкой: одна озвучка — один вызов движка."""
+        return self.scene_spoken(lines, stress=stress)[0]
 
-        Контекст важен: «Большая языковая модель» RUAccent разбирает как больш+ая язык+овая,
-        а не б+ольшая язык+овая, и без соседних слов омограф не снимается.
+    def scene_spoken(self, lines, line_ids=None, scene=None, stress=True):
+        """Текст сцены для движка и список спорных мест.
+
+        Возвращает (speech, occurrences). В occurrences — по одной записи на омограф:
+        где он стоит в реплике, какое прочтение выбрано, какие ещё предлагает словарь
+        и чьё это решение — библиотеки или ваше.
+
+        Контекст тут важен: омограф снимается соседними словами, и «Большая языковая
+        модель» и «Большая книга» читаются по-разному. Поэтому библиотека смотрит на
+        сцену целиком, а не на реплику по отдельности.
         """
-        return self.text(" ".join(self.line(ln, stress=False) for ln in lines
-                                  if (ln.get("text") or "").strip()), stress=stress)
+        line_ids = line_ids if line_ids is not None else list(range(len(lines)))
+        # 1. Текст сцены: реплики склеены, ручной `speech` подставлен.
+        parts, owner = [], []
+        for k, ln in enumerate(lines):
+            manual = (ln.get("speech") or "").strip()
+            text_k = manual if manual else (ln.get("text") or "").strip()
+            self._lines_present.add((scene, text_k))
+            if not text_k:
+                continue
+            parts.append(text_k)
+            for j in range(len(WORD.findall(text_k))):
+                owner.append((k, j))
+        joined = " ".join(parts)
+        if not stress or self._acc is None:
+            return (self._gloss(joined)[0], [])
+
+        # 2. Глоссарий: латиница → произносимое. Слова при этом разъезжаются,
+        #    поэтому запоминаем, какое произнесённое слово пришло из какого написанного.
+        glossed, gmap = self._gloss(joined)
+        # 3. Библиотека снимает омографы по контексту сцены.
+        marked = self._acc.process_all(glossed)
+        spans = list(MARKED.finditer(marked))
+        if len(spans) != sum(len(x) for x in gmap):
+            self.warnings.append(f"сцена {scene}: RUAccent изменил число слов — "
+                                 "ударения не проставлены")
+            return marked, []
+        # 4. Какое произнесённое слово из какой реплики и под каким номером.
+        where = {}
+        for p, targets in enumerate(gmap):
+            if p >= len(owner):
+                continue
+            for t in targets:
+                where[t] = owner[p]
+
+        out, occurrences = [], []
+        seen = {}           # реплика → номера слов, которые в ней нашлись
+        for g, sp in enumerate(spans):
+            tok = sp.group(0)
+            plain = tok.replace("+", "")
+            key = plain.lower()
+            at = where.get(g)
+            ov = None
+            if at is not None:
+                ov = self.overrides.get((scene, (lines[at[0]].get("text") or "").strip()), {}).get(at[1])
+                seen.setdefault(at[0], set()).add(at[1])
+            if key not in self.omographs:
+                # Не омограф: «+» убираем, иначе мы отвечали бы за ударение каждого
+                # слова ролика, а движок справляется с однозначными сам.
+                out.append(plain)
+                if ov:
+                    # Слово не из списка омографов — трогать его нельзя: читать его
+                    # иначе нечем, а форма из словаря для него не существует.
+                    self._rejected.append({"scene": scene, "line": at[0], "word": at[1],
+                                           "form": ov, "text": plain,
+                                           "why": "слово не омограф — его нечего читать иначе"})
+                continue
+            form, source = tok, "library"
+            if ov:
+                form, source = self._apply(scene, at[0], lines[at[0]], at[1], plain, tok, form)
+            out.append(form)
+            occurrences.append({
+                "line": line_ids[at[0]] if at is not None else None,
+                "word": at[1] if at is not None else None,
+                "text": plain,
+                "form": form,
+                "alternatives": [a for a in self.omographs.get(key, [])
+                                 if a.lower() != form.lower()],
+                "source": source,
+            })
+        # Прочтения, у которых нет такого слова в реплике: номер слова больше, чем
+        # слов в строке, — их отмечаем отдельно, иначе они выглядят как «реплика
+        # изменилась», а это другое.
+        for k, line_text in ((k, (lines[k].get("text") or "").strip()) for k in seen):
+            for word, form in self.overrides.get((scene, line_text), {}).items():
+                if word not in seen[k]:
+                    self._orphan.append({"scene": scene, "line": k, "word": word, "form": form})
+        return rebuild(marked, out), occurrences
+
+    def _gloss(self, text):
+        """Подставить латиницу вместе с картой слов."""
+        if self.language == "ru":
+            return gloss_with_map(text, self.gloss)
+        return text, [[i] for i in range(len(WORD.findall(text)))]
+
+    def _apply(self, scene, line_no, ln, word, plain, tok, form):
+        """Ваше прочтение вместо библиотечного — если оно есть и выдержало проверку.
+
+        Проверок три: слово должно быть омографом (иначе его нечего читать иначе),
+        форма должна быть одной из тех, что предлагает словарь, и форма должна быть
+        такой, чтобы движок не исказил слово.
+        """
+        ov = self.overrides.get((scene, (ln.get("text") or "").strip()), {}).get(word)
+        if not ov:
+            return form, "library"
+        legal = self.omographs.get(plain.lower(), [])
+        why = None
+        if not any(a.lower() == ov.lower() for a in legal):
+            why = f"формы «{ov}» нет в словаре ({', '.join(legal) or '—'})"
+        else:
+            err = stress_error(plain, ov)
+            if err:
+                why = err
+        if why:
+            self.warnings.append(f"прочтение «{ov}» для «{plain}» отброшено — {why}")
+            self._rejected.append({"scene": scene, "line": line_no, "word": word,
+                                   "form": ov, "text": plain, "why": why})
+            return form, "library"
+        self._used.add((scene, (ln.get("text") or "").strip(), word))
+        return match_case(ov, tok), "override"
+
+    def unused_overrides(self):
+        """Прочтения, чья реплика изменилась: якорь перестал совпадать.
+
+        Якорь — текст реплики. Если человек переписал её, прочтение молча применять
+        не к чему, и молча терять его тоже нельзя: показываем как устаревшее.
+        """
+        out = []
+        for (scene, line), words_ in self.overrides.items():
+            if (scene, line) in self._lines_present:
+                continue
+            for word, form in words_.items():
+                out.append({"scene": scene, "line": line, "word": word, "form": form})
+        return out
+
+    def rejected_overrides(self):
+        """Прочтения, которые не применились: слово не омограф или формы нет в словаре."""
+        return list(self._rejected)
+
+    def orphan_overrides(self):
+        """Прочтения, у которых в реплике нет такого номера слова."""
+        return list(self._orphan)
 
     def _mark_omographs(self, text):
         """Оставить `+` только там, где слово омограф; остальное вернуть как было.
 
         RUAccent отмечает ударение в каждом слове. Оставлять все отметки нельзя: движок,
         увидев `+`, перестаёт акцентировать сам, и мы отвечаем за каждое слово ролика.
-        Формы из voice.stress применяются после: это ручное решение поверх RUAccent.
         """
+        if self._acc is None:
+            return text
         marked = self._acc.process_all(text)
-        omographs = self.omographs
-
-        def repl(m):
-            w = m.group(0)
-            override = self.stress.get(w.replace("+", "").lower())
-            if override:
-                return override if w[:1].isupper() else override.lower()
-            return w if w.replace("+", "").lower() in omographs else w.replace("+", "")
-
-        return MARKED.sub(repl, marked)
+        out = []
+        for m in MARKED.finditer(marked):
+            tok = m.group(0)
+            plain = tok.replace("+", "")
+            out.append(tok if plain.lower() in self.omographs else plain)
+        return rebuild(marked, out)
 
     # -- отчёт ---------------------------------------------------------------
 
     def changed(self, lines):
-        """Реплики, у которых речевой текст отличается от написанного."""
+        """Реплики, у которых речевой текст отличается от написанного.
+
+        Без ударений: расхождение из-за `+` — это не другой текст, а другое прочтение
+        того же слова, и оно показывается отдельно, списком спорных мест.
+        """
         out = []
         for i, ln in enumerate(lines):
-            spoken = self.line(ln)
+            spoken = self.line(ln, stress=False)
             if spoken.strip() != (ln.get("text") or "").strip():
                 out.append({"line": i, "text": ln.get("text", ""), "speech": spoken})
         return out
 
-    def stress_marks(self, lines):
-        """Где стоит `+`: для глаза и для проверки результата."""
+    def occurrences(self, lines, groups):
+        """Спорные места по всем сценам: где стоит омограф и какое прочтение выбрано."""
         out = []
-        for i, ln in enumerate(lines):
-            for w in MARKED.findall(self.line(ln)):
-                if "+" in w:
-                    out.append({"line": i, "form": w})
+        for si, idx in enumerate(groups):
+            _, occ = self.scene_spoken([lines[i] for i in idx], idx, si)
+            out.extend(occ)
         return out
 
 
@@ -282,9 +519,13 @@ def main():
 
     n = load_narration(a.narration)
     p = Pronouncer(n, stress=not a.no_stress, model_size=a.model_size)
+    groups = scene_groups(n)
     report = {"language": p.language,
               "changed": p.changed(n["lines"]),
-              "stress": p.stress_marks(n["lines"]),
+              "stress": p.occurrences(n["lines"], groups),
+              "stale": p.unused_overrides(),
+              "rejected": p.rejected_overrides(),
+              "orphan": p.orphan_overrides(),
               "warnings": p.warnings}
     out = a.out or os.path.join(os.path.dirname(a.narration) or ".", "speech_report.json")
     with open(out, "w") as fh:
@@ -297,12 +538,23 @@ def main():
     for x in report["changed"]:
         print(f"  [{x['line']:2}] {x['text']}\n       → {x['speech']}")
     if report["stress"]:
-        print(f"  ударений поставлено: {len(report['stress'])}")
+        print(f"  спорных мест: {len(report['stress'])}")
         for x in report["stress"]:
-            print(f"    строка {x['line']:2}: {x['form']}")
+            alt = ", ".join(x["alternatives"]) or "—"
+            print(f"    строка {x['line']:2} слово {x['word']}: {x['form']} "
+                  f"[{x['source']}] · другие: {alt}")
+    for x in report["stale"]:
+        print(f"  ⚠️  прочтение «{x['form']}» не применено: реплики «{x['line'][:40]}» "
+              f"в сцене {x['scene']} больше нет")
+    for x in report["rejected"]:
+        print(f"  ⚠️  прочтение «{x['form']}» для «{x['text']}» отброшено — {x['why']}")
+    for x in report["orphan"]:
+        print(f"  ⚠️  прочтение «{x['form']}» отброшено: в реплике сцены {x['scene']} "
+              f"нет слова №{x['word']}")
     for w in p.warnings:
         print(f"  ⚠️  {w}")
     print("→", out)
+
 
 
 if __name__ == "__main__":

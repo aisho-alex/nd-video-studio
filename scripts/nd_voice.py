@@ -32,7 +32,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 from ndv_common import (clip_name, envelope, load_narration, nd_speak, nd_transcribe,  # noqa: E402
-                        retry, scene_name, silence_spans, trim_silence, wav_samples, write_wav)
+                        retry, scene_groups, scene_name, silence_spans, trim_silence,
+                        wav_samples, write_wav)
 from pronounce import Pronouncer  # noqa: E402
 from difflib import SequenceMatcher  # noqa: E402
 
@@ -44,18 +45,6 @@ SNAP_WINDOW = 0.5       # на каком расстоянии от конца �
 
 def tokens(s):
     return WORD.findall(s.lower().replace("ё", "е"))
-
-
-def scene_groups(n):
-    """Реплики по сценам, в порядке следования. Без поля `scene` — одна группа."""
-    groups, seen = [], {}
-    for i, ln in enumerate(n["lines"]):
-        key = ln.get("scene")
-        if key is None or key not in seen:
-            seen[key] = len(groups)
-            groups.append([])
-        groups[seen[key]].append(i)
-    return groups
 
 
 MATCH = 0.5          # насколько распознанное слово должно совпадать с ожидаемым
@@ -202,14 +191,34 @@ def main():
         selected = set(range(len(groups)))
 
     report, failed = [], []
+    # Отчёт прошлого прогона: при переозвучке одной сцены записи по остальным сценам
+    # надо сохранить. Иначе «переозвучить сцену» стирал бы длительности и нарезку
+    # ролика в интерфейсе, а сцены эти никто не переозвучивал.
+    report_path = os.path.join(os.path.dirname(a.out_dir) or ".", "speech_report.json")
+    previous = {}
+    if os.path.exists(report_path):
+        try:
+            with open(report_path) as f:
+                previous = {e.get("scene"): e for e in json.load(f)}
+        except (ValueError, OSError):
+            previous = {}
     for si, idx in enumerate(groups):
+        # Текст сцены и список спорных мест считаем всегда, даже если сцену не
+        # озвучиваем: интерфейс показывает, где стоит омограф и какое прочтение
+        # выбрано, и это не зависит от того, синтезировали мы её сейчас или нет.
+        text, occ = pron.scene_spoken([n["lines"][i] for i in idx], idx, si)
+        spoken = [pron.line(n["lines"][i], stress=False) for i in idx]
         if si not in selected:
-            report.append({"scene": si, "lines": idx, "skipped": True})
+            kept = dict(previous.get(si) or {})
+            # «skipped» значит «в этом прогоне не озвучивалось». У сохранённой записи
+            # своя озвучка на месте, и интерфейс должен её показывать.
+            if not kept:
+                kept["skipped"] = True
+            kept.update({"scene": si, "lines": idx, "stress": occ})
+            report.append(kept)
             continue
         beats = {n["lines"][i].get("scene") for i in idx}
         beat = n["scenes"][min(beats)]["beat"] if beats and n.get("scenes") and min(beats) is not None else None
-        text = pron.scene([n["lines"][i] for i in idx])
-        spoken = [pron.line(n["lines"][i], stress=False) for i in idx]
 
         # Восстановление: синтеза нет вообще, набор возвращается как есть и просто
         # перерезается. Синтезировать заново здесь нельзя — это было бы третье чтение,
@@ -241,7 +250,8 @@ def main():
             print(f"  сцена {si}: нет паузы на стыке {no_pause}, переозвучка ({attempt}/{attempts})")
         if result is None:
             failed.append(si)
-            report.append({"scene": si, "lines": idx, "error": "нет паузы на стыке реплик"})
+            report.append({"scene": si, "lines": idx, "error": "нет паузы на стыке реплик",
+                           "stress": occ})
             continue
 
         samples, sr, engine, cuts, heard = result
@@ -250,6 +260,7 @@ def main():
                  "restored": si in restore,
                  # есть ли что возвращать: интерфейс показывает кнопку отката
                  "prev": os.path.exists(os.path.join(a.out_dir, scene_name(si, prev=True))),
+                 "stress": occ,
                  "clips": []}
         for k, li in enumerate(idx):
             a0, a1 = int(cuts[k] * sr), int(cuts[k + 1] * sr)
@@ -268,6 +279,9 @@ def main():
     out = os.path.join(os.path.dirname(a.out_dir) or ".", "speech_report.json")
     with open(out, "w") as f:
         json.dump(report, f, ensure_ascii=False, indent=1)
+    for x in pron.unused_overrides():
+        print(f"⚠️  прочтение «{x['form']}» не применено: реплика в сцене {x['scene']} "
+              f"изменилась — «{x['line'][:60]}»")
     print("→", out)
     if failed:
         raise SystemExit(f"сцены {failed}: движок не оставил паузы на стыках реплик. "

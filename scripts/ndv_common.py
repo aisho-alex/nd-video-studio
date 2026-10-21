@@ -73,6 +73,23 @@ def clip_name(i):
     return f"line_{i:02d}.wav"
 
 
+def scene_groups(n):
+    """Реплики по сценам, в порядке следования. Без поля `scene` — одна группа.
+
+    Живёт здесь, а не в nd_voice.py: тем же порядком собирают сцены и произношение
+    (pronounce.py), иначе отчёт об ударениях считался бы по одним сценам, а озвучка
+    шла бы по другим.
+    """
+    groups, seen = [], {}
+    for i, ln in enumerate(n["lines"]):
+        key = ln.get("scene")
+        if key is None or key not in seen:
+            seen[key] = len(groups)
+            groups.append([])
+        groups[seen[key]].append(i)
+    return groups
+
+
 def scene_name(i, prev=False):
     return f"scene_{i:02d}.prev.wav" if prev else f"scene_{i:02d}.wav"
 
