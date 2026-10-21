@@ -255,6 +255,13 @@ def main():
             continue
 
         samples, sr, engine, cuts, heard = result
+        if si in restore:
+            # Восстановленный набор озвучен прежним текстом, а не тем, что сейчас в
+            # нарративе. Отчёт должен описывать звук на диске — иначе «прочтение
+            # размечено, но ещё не озвучено» погаснет, хотя в звуке его нет.
+            prev_entry = previous.get(si) or {}
+            text = prev_entry.get("speech", text)
+            occ = prev_entry.get("stress", occ)
         entry = {"scene": si, "lines": idx, "engine": engine, "beat": beat,
                  "duration": round(len(samples) / sr, 2), "speech": text,
                  "restored": si in restore,
