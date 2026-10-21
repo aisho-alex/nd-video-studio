@@ -96,8 +96,11 @@ def main():
         src, dst = os.path.join(a.raw_dir, clip_name(i)), os.path.join(a.out_dir, clip_name(i))
         t = per_scene.get(i, 1.0) if not a.line_tempo else tempo[i]
         # обрезка тишины и темп в одном проходе: тишину режем обязательно, без неё
-        # начало реплики начинается на полном уровне и щёлкает
-        ffmpeg("-i", src, "-af", f"{TRIM},atempo={t:.4f}", "-ar", "48000", dst)
+        # начало реплики начинается на полном уровне и щёлкает. Темп в этом пайплайне
+        # всегда 1.0 — окно реплики retime.py выводит ровно под длину речи, — так что
+        # лишний atempo ради единицы только тратит время.
+        af = TRIM if abs(t - 1.0) < 0.005 else f"{TRIM},atempo={t:.4f}"
+        ffmpeg("-i", src, "-af", af, "-ar", "48000", dst)
         if t > a.max_tempo:
             status = "TOO LONG"
         elif t < a.min_tempo:

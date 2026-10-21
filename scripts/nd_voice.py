@@ -131,6 +131,32 @@ def voice_scene(text, voice, language, style, tries, seed):
                                   tries=1, seed=seed), tries)
 
 
+def keep_previous(out_dir, si):
+    """Отложить текущий набор сцены, прежде чем озвучить её заново.
+
+    Движок случаен: тот же текст читается каждый раз чуть иначе. Если новый вариант не
+    понравился, вернуть можно только прошлый — и вернуть нужно именно его, без повторного
+    синтеза, иначе получится третье чтение, а не то, которое человек уже слышал. Хранится
+    ровно один предыдущий вариант на сцену, история не растёт.
+    """
+    cur = os.path.join(out_dir, scene_name(si))
+    if not os.path.exists(cur):
+        return False
+    with open(cur, "rb") as src, open(os.path.join(out_dir, scene_name(si, prev=True)), "wb") as dst:
+        dst.write(src.read())
+    return True
+
+
+def process_scene(data, spoken):
+    """Нарезка озвучки сцены на реплики. Работает и для свежего синтеза, и для отложенного.
+
+    (сэмплы, sr, резы, что услышали в каждой реплике, реплики без паузы)
+    """
+    samples, sr = wav_samples(data)
+    cuts, heard, no_pause = cut_scene(samples, sr, spoken, nd_transcribe(data, "whisper-1")["words"])
+    return samples, sr, cuts, heard, no_pause
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("narration")
@@ -143,6 +169,8 @@ def main():
     ap.add_argument("--model-size", default="turbo2", help="модель омографов ruaccent")
     ap.add_argument("--only", type=int, nargs="*", help="переозвучить реплики (переозвучиваются их сцены)")
     ap.add_argument("--scenes", type=int, nargs="*", help="переозвучить эти сцены")
+    ap.add_argument("--restore-scenes", type=int, nargs="*",
+                    help="вернуть прошлый набор этих сцен (scene_NN.prev.wav) и перерезать его")
     ap.add_argument("--tries", type=int, default=5)
     ap.add_argument("--seed", type=int, default=7)
     a = ap.parse_args()
@@ -162,15 +190,20 @@ def main():
     print(f"{a.model or ('espeech-tts' if language == 'Russian' else 'qwen3-tts')} · {voice} · {language} · "
           f"{len(groups)} сцен(ы) по одному вызову")
 
-    want = None
+    restore = set(a.restore_scenes or [])
+    # Что озвучиваем. Важно: восстановление тоже задаёт выборку. Без этого «вернуть сцену 2»
+    # прогоняло синтез по всем остальным сценам — дорого и неожиданно.
+    selected = set(restore)
     if a.scenes:
-        want = set(a.scenes)
+        selected |= set(a.scenes)
     elif a.only:
-        want = {si for si, idx in enumerate(groups) if any(i in a.only for i in idx)}
+        selected |= {si for si, idx in enumerate(groups) if any(i in a.only for i in idx)}
+    if not selected:
+        selected = set(range(len(groups)))
 
     report, failed = [], []
     for si, idx in enumerate(groups):
-        if want is not None and si not in want:
+        if si not in selected:
             report.append({"scene": si, "lines": idx, "skipped": True})
             continue
         beats = {n["lines"][i].get("scene") for i in idx}
@@ -178,18 +211,34 @@ def main():
         text = pron.scene([n["lines"][i] for i in idx])
         spoken = [pron.line(n["lines"][i], stress=False) for i in idx]
 
+        # Восстановление: синтеза нет вообще, набор возвращается как есть и просто
+        # перерезается. Синтезировать заново здесь нельзя — это было бы третье чтение,
+        # а человек возвращает то, что уже слышал.
+        kept = None
+        if si in restore:
+            prev = os.path.join(a.out_dir, scene_name(si, prev=True))
+            if not os.path.exists(prev):
+                raise SystemExit(f"сцена {si}: нет предыдущего набора ({os.path.basename(prev)})")
+            with open(prev, "rb") as f:
+                kept = f.read()
+            engine = "prev"
+
         result = None
-        for attempt in (1, 2):
-            data, engine = voice_scene(text, voice, language, styles.get(beat, style), a.tries, a.seed)
+        attempts = 1 if kept else 2
+        for attempt in range(1, attempts + 1):
+            if kept:
+                data = kept
+            else:
+                data, engine = voice_scene(text, voice, language, styles.get(beat, style), a.tries, a.seed)
+                if attempt == 1:
+                    keep_previous(a.out_dir, si)
             with open(os.path.join(a.out_dir, scene_name(si)), "wb") as f:
                 f.write(data)
-            res = nd_transcribe(data, "whisper-1", scene_name(si))
-            samples, sr = wav_samples(data)
-            cuts, heard, no_pause = cut_scene(samples, sr, spoken, res["words"])
+            samples, sr, cuts, heard, no_pause = process_scene(data, spoken)
             if not no_pause:
                 result = (samples, sr, engine, cuts, heard)
                 break
-            print(f"  сцена {si}: нет паузы на стыке {no_pause}, переозвучка ({attempt}/2)")
+            print(f"  сцена {si}: нет паузы на стыке {no_pause}, переозвучка ({attempt}/{attempts})")
         if result is None:
             failed.append(si)
             report.append({"scene": si, "lines": idx, "error": "нет паузы на стыке реплик"})
@@ -197,7 +246,11 @@ def main():
 
         samples, sr, engine, cuts, heard = result
         entry = {"scene": si, "lines": idx, "engine": engine, "beat": beat,
-                 "duration": round(len(samples) / sr, 2), "speech": text, "clips": []}
+                 "duration": round(len(samples) / sr, 2), "speech": text,
+                 "restored": si in restore,
+                 # есть ли что возвращать: интерфейс показывает кнопку отката
+                 "prev": os.path.exists(os.path.join(a.out_dir, scene_name(si, prev=True))),
+                 "clips": []}
         for k, li in enumerate(idx):
             a0, a1 = int(cuts[k] * sr), int(cuts[k + 1] * sr)
             clip = trim_silence(samples[a0:a1], sr)

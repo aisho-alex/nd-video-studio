@@ -67,6 +67,9 @@ def rms(s, a, b):
 
 
 def edges(s, sr, fin=FADE_IN, fout=FADE_OUT):
+    # Опорное окно шире рампы вчетверо: если в 30–80 мс перед концом реплики попалась
+    # тихая пауза между словами, короткое окно становится опорой, и исправная рампа читается
+    # как щелчок (-7 dB против порога -8).
     """Уровень у самого края против устоявшегося уровня рядом, в дБ.
 
     Это и есть щелчок в отличие от рампы: клип, который открывается (или закрывается) на
@@ -77,7 +80,7 @@ def edges(s, sr, fin=FADE_IN, fout=FADE_OUT):
     рампы в 10 мс читаются как -6 дБ. Сравнивать надо с тем, что рядом установилось.
     """
     w = max(1, int(0.002 * sr))
-    span = int(0.05 * sr)
+    span = int(0.20 * sr)
     step = max(1, int(WIN * sr))
     if len(s) <= w:
         return {"head_db": -120.0, "tail_db": -120.0}
@@ -187,7 +190,7 @@ def check_mix(path, narration, clips_dir):
     lines = load_narration(narration)["lines"]
     w = max(1, int(0.002 * sr))
     step = max(1, int(WIN * sr))
-    span = int(0.05 * sr)
+    span = int(0.20 * sr)     # см. edges(): опора не должна попасть в тихую паузу
     out = []
     for i, ln in enumerate(lines):
         a = int(ln["start"] * sr)

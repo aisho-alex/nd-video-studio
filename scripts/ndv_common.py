@@ -73,8 +73,8 @@ def clip_name(i):
     return f"line_{i:02d}.wav"
 
 
-def scene_name(i):
-    return f"scene_{i:02d}.wav"
+def scene_name(i, prev=False):
+    return f"scene_{i:02d}.prev.wav" if prev else f"scene_{i:02d}.wav"
 
 
 # ---- аудио в памяти: stdlib, потому что в образе нет ни numpy, ни scipy ----
