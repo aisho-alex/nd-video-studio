@@ -81,7 +81,10 @@ def main():
         elif os.path.getsize(path) <= 44:      # 44 байта — заголовок wav без звука
             missing.append((i, f"пустой ({os.path.getsize(path)} байт)"))
     if missing:
-        scenes = sorted({i for i, _ in missing})
+        # Номера сцен, а не реплик: переозвучивают сцену, и «сцена 12» в сообщении
+        # отправляет человека крутить не туда.
+        scene_of = {li: si for si, idx in enumerate(groups) for li in idx}
+        scenes = sorted({scene_of.get(i, i) for i, _ in missing})
         detail = ", ".join(f"реплика {i}: {why}" for i, why in missing[:5])
         raise SystemExit(f"озвучка сцен {scenes} не удалась — клипов нет ({detail}). "
                          f"Переозвучите эти сцены: стадия «Голос» убирает битые клипы, "
