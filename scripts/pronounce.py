@@ -31,10 +31,22 @@ ESpeech на стороне хаба. Выбор прочтения — тоже
 и не спорит со словарём. Свои формы ударений здесь не выдумываются: «а+гент» вместо
 «аг+ент» — это ровно тот класс ошибок, который ломает реплику целиком.
 
-Важное правило: `+` ставится ТОЛЬКО в словах, которые RUAccent считает омографами. По
-документации хаба, как только `+` есть в тексте, авто-акцентизатор не вмешивается
-(`docs`: «если `+` уже есть в тексте, авто-акцентизатор не вмешивается»), значит
-отметив всё подряд мы взяли бы на себя риск за каждое слово ролика вместо десятка омографов.
+Правило разметки: `+` ставится во всех словах, а не только в омографах. Причина в том,
+что авто-акцентиация на стороне хаба — переключатель на весь текст: по документации, как
+только `+` есть в тексте, авто-акцентизатор не вмешивается (`docs`: «если `+` уже есть
+в тексте, авто-акцентиатор не вмешивается»). Отметив десять омографов, мы выключали
+акцентуацию всей сцены и оставляли двести с лишним слов читать как угодно: «вопрос»
+выходил «вОпрос», «разговор» — «рАзговор». Среднего варианта нет — либо меток нет
+вовсе, либо они на каждом слове.
+
+Чьи именно метки уходят в движок, решает `--accent`:
+
+    dictionary   (по умолчанию) только то, что RUAccent знает из словаря — формы
+                берутся lookup'ом и не могут быть выдуманы. Слова вне словаря (бренды,
+                транслитерации) остаются без метки: их разметка идёт через нейросеть, и
+                мы бы отвечали за чужую ошибку.
+    all          всё, что вернул process_all, включая нейросетевые догадки.
+    omographs    прежнее поведение: `+` только в омографах. Оставлено как откат.
 
     python3 scripts/pronounce.py projects/x/narration.json          # отчёт, без сети
     python3 scripts/pronounce.py projects/x/narration.json --json
@@ -248,23 +260,36 @@ def gloss_spans(text, table):
     return out
 
 
+ACCENTS = ("dictionary", "all", "omographs")
+
+
 class Pronouncer:
     """Речевой текст проекта. `stress=False` не грузит ruaccent — только глоссарий."""
 
-    def __init__(self, narration, stress=True, model_size="turbo2"):
+    def __init__(self, narration, stress=True, model_size="turbo2", accent="dictionary"):
         v = narration.get("voice") or {}
         self.language = narration.get("language", "en")
+        if accent not in ACCENTS:
+            raise ValueError(f"неизвестный режим разметки ударений: {accent} "
+                             f"(доступно: {', '.join(ACCENTS)})")
+        self.accent = accent
         self.gloss = dict(GLOSS)
         self.gloss.update(v.get("pronounce") or {})
         self.warnings = []
         # Ваши прочтения: (сцена, текст реплики) → {номер слова: форма}.
         self.overrides = {}
         self.omographs = {}
+        self.dictionary = {}
         self._acc = None
         self._used = set()
         self._lines_present = set()
         self._rejected = []
         self._orphan = []
+        # Разметка ударений видна в логе стадии числами: иначе правка «везде» выглядит
+        # как «ничего не изменилось», а меняет двести слов.
+        self.marked = 0
+        self.unmarked = 0
+        self.bad_marks = []
         if stress and self.language == "ru":
             self._load(model_size)
         self._load_overrides(v)
@@ -302,6 +327,10 @@ class Pronouncer:
         acc.load(omograph_model_size=model_size, use_dictionary=True)
         self._acc = acc
         self.omographs = getattr(acc, "omographs", {}) or {}
+        # Словарь нужен, чтобы отличить форму, взятую lookup'ом, от догадки нейросети:
+        # в `_process_accent` ruaccent сначала смотрит сюда и гоняет в модель только то,
+        # чего в словаре нет.
+        self.dictionary = getattr(acc, "accents", {}) or {}
 
     # -- текст ---------------------------------------------------------------
 
@@ -319,7 +348,46 @@ class Pronouncer:
     def text(self, raw, stress=None):
         out = latin_gloss(raw, self.gloss) if self.language == "ru" else raw
         use = (self._acc is not None) if stress is None else (stress and self._acc is not None)
-        return self._mark_omographs(out) if use else out
+        return self._mark_all(out) if use else out
+
+    # -- разметка ударений ----------------------------------------------------
+
+    def _keep_mark(self, plain):
+        """Оставлять ли `+` у этого слова — по режиму `--accent`.
+
+        `dictionary` (по умолчанию) берёт формы из словаря RUAccent: они получены
+        lookup'ом и не могут оказаться выдумкой нейросети. Слово вне словаря (бренд,
+        транслитерация) в этом режиме остаётся без метки, и читать его будет движок —
+        но таких слов единицы, а не весь текст сцены.
+        """
+        if self.accent == "omographs":
+            return False
+        if self.accent == "all":
+            return True
+        return plain.lower() in self.dictionary
+
+    def _checked(self, plain, tok):
+        """Метка, готовая к отправке: форма RUAccent, прошедшая проверку.
+
+        Проверка та же, что для ручных форм (`stress_error`): `+` ровно один, перед
+        гласной, форма — то же слово. RUAccent такие позиции не даёт, поэтому откат
+        срабатывает на мусорных словах, а не на каждом втором.
+        """
+        if not self._keep_mark(plain):
+            self.unmarked += 1
+            return plain
+        err = stress_error(plain, tok)
+        if err:
+            self.bad_marks.append({"text": plain, "form": tok, "why": err})
+            self.unmarked += 1
+            return plain
+        self.marked += 1
+        return tok
+
+    def mark_stats(self):
+        """Сколько слов ушло с меткой, сколько без, сколько меток отброшено."""
+        return {"accent": self.accent, "marked": self.marked,
+                "unmarked": self.unmarked, "rejected": len(self.bad_marks)}
 
     def scene(self, lines, stress=True):
         """Текст сцены одной строкой: одна озвучка — один вызов движка."""
@@ -383,9 +451,12 @@ class Pronouncer:
                 ov = self.overrides.get((sc, (lines[at[0]].get("text") or "").strip()), {}).get(at[1])
                 seen.setdefault(at[0], set()).add(at[1])
             if key not in self.omographs:
-                # Не омограф: «+» убираем, иначе мы отвечали бы за ударение каждого
-                # слова ролика, а движок справляется с однозначными сам.
-                out.append(plain)
+                # Не омограф, но ударение ему всё равно нужно. Метка хоть в одном
+                # слове выключает авто-акцентиацию хаба на всю сцену, и без метки
+                # движок читает «вопрос» как «вОпрос». Поэтому оставляем то, что
+                # дал словарь RUAccent, а форму из `stress_occurrences` здесь не
+                # принимаем: её нечем проверить, вариантов у не-омографа нет.
+                out.append(self._checked(plain, tok))
                 if ov:
                     # Слово не из списка омографов — трогать его нельзя: читать его
                     # иначе нечем, а форма из словаря для него не существует.
@@ -398,6 +469,7 @@ class Pronouncer:
                 form, source = self._apply(self._scene_of(lines[at[0]], scene), at[0],
                                           lines[at[0]], at[1], plain, tok, form)
             out.append(form)
+            self.marked += 1
             occurrences.append({
                 "line": line_ids[at[0]] if at is not None else None,
                 "word": at[1] if at is not None else None,
@@ -485,20 +557,19 @@ class Pronouncer:
         """Прочтения, у которых в реплике нет такого номера слова."""
         return list(self._orphan)
 
-    def _mark_omographs(self, text):
-        """Оставить `+` только там, где слово омограф; остальное вернуть как было.
+    def _mark_all(self, text):
+        """Разметить ударения во всех словах, а не только в омографах.
 
-        RUAccent отмечает ударение в каждом слове. Оставлять все отметки нельзя: движок,
-        увидев `+`, перестаёт акцентировать сам, и мы отвечаем за каждое слово ролика.
+        Метка хоть в одном слове выключает авто-акцентиацию хаба на весь текст, поэтому
+        «почти не размечать» — это «не размечать ничего»: сцена с десятью омографами
+        остаётся с двумястами словами, которые движок произносит как угодно. Значит
+        размечаем всё, а `--accent` решает, какие именно формы туда попадут.
         """
         if self._acc is None:
             return text
         marked = self._acc.process_all(text)
-        out = []
-        for m in MARKED.finditer(marked):
-            tok = m.group(0)
-            plain = tok.replace("+", "")
-            out.append(tok if plain.lower() in self.omographs else plain)
+        out = [self._checked(m.group(0).replace("+", ""), m.group(0))
+               for m in MARKED.finditer(marked)]
         return rebuild(marked, out)
 
     # -- отчёт ---------------------------------------------------------------
@@ -531,15 +602,23 @@ def main():
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--out")
     ap.add_argument("--model-size", default="turbo2", help="модель омографов ruaccent")
+    ap.add_argument("--accent", default="dictionary", choices=ACCENTS,
+                    help="чьи ударения уходят в движок: из словаря ruaccent, все или "
+                         "только омографы (прежнее поведение, оставлено как откат)")
     ap.add_argument("--no-stress", action="store_true", help="без ruaccent: только глоссарий")
     a = ap.parse_args()
 
     n = load_narration(a.narration)
-    p = Pronouncer(n, stress=not a.no_stress, model_size=a.model_size)
+    p = Pronouncer(n, stress=not a.no_stress, model_size=a.model_size, accent=a.accent)
     groups = scene_groups(n)
+    # Порядок важен: occurrences разбирает сцены и тем же проходом считает разметку,
+    # поэтому снимок счётчиков снимаем после него, а не раньше.
+    stress = p.occurrences(n["lines"], groups)
     report = {"language": p.language,
+              "marks": p.mark_stats(),
+              "bad_marks": p.bad_marks,
               "changed": p.changed(n["lines"]),
-              "stress": p.occurrences(n["lines"], groups),
+              "stress": stress,
               "stale": p.unused_overrides(),
               "rejected": p.rejected_overrides(),
               "orphan": p.orphan_overrides(),
@@ -551,7 +630,11 @@ def main():
     if a.json:
         print(json.dumps(report, ensure_ascii=False, indent=1))
         return
-    print(f"{p.language}: глоссарий {len(p.gloss)}, омографов в словаре {len(p.omographs)}")
+    m = report["marks"]
+    print(f"{p.language}: глоссарий {len(p.gloss)}, омографов в словаре {len(p.omographs)}, "
+          f"слов в словаре {len(p.dictionary)}")
+    print(f"  ударения [{m['accent']}]: с меткой {m['marked']}, без метки {m['unmarked']}, "
+          f"отброшено {m['rejected']}")
     for x in report["changed"]:
         print(f"  [{x['line']:2}] {x['text']}\n       → {x['speech']}")
     if report["stress"]:
@@ -568,6 +651,8 @@ def main():
     for x in report["orphan"]:
         print(f"  ⚠️  прочтение «{x['form']}» отброшено: в реплике сцены {x['scene']} "
               f"нет слова №{x['word']}")
+    for x in report["bad_marks"]:
+        print(f"  ⚠️  ударение «{x['form']}» у слова «{x['text']}» отброшено — {x['why']}")
     for w in p.warnings:
         print(f"  ⚠️  {w}")
     print("→", out)

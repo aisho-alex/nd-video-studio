@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from ndv_common import (clip_name, envelope, load_narration, nd_speak, nd_transcribe,  # noqa: E402
                         retry, scene_groups, scene_name, silence_spans, trim_silence,
                         wav_samples, write_wav)
-from pronounce import Pronouncer  # noqa: E402
+from pronounce import ACCENTS, Pronouncer  # noqa: E402
 from difflib import SequenceMatcher  # noqa: E402
 
 LANGUAGES = {"ru": "Russian", "en": "English"}
@@ -156,6 +156,9 @@ def main():
     ap.add_argument("--styles", help="json: смена бита → стиль (beat: \"...\")")
     ap.add_argument("--model", help="espeech-tts или qwen3-tts; по умолчанию по языку")
     ap.add_argument("--model-size", default="turbo2", help="модель омографов ruaccent")
+    ap.add_argument("--accent", default="dictionary", choices=ACCENTS,
+                    help="чьи ударения уходят в движок: из словаря ruaccent, все или "
+                         "только омографы (прежнее поведение, оставлено как откат)")
     ap.add_argument("--only", type=int, nargs="*", help="переозвучить реплики (переозвучиваются их сцены)")
     ap.add_argument("--scenes", type=int, nargs="*", help="переозвучить эти сцены")
     ap.add_argument("--restore-scenes", type=int, nargs="*",
@@ -170,7 +173,7 @@ def main():
     language = a.language or LANGUAGES.get(n.get("language", "en"), "Auto")
     style = a.style or v.get("style")
     styles = json.loads(a.styles) if a.styles else (v.get("styles") or {})
-    pron = Pronouncer(n, stress=True, model_size=a.model_size)
+    pron = Pronouncer(n, stress=True, model_size=a.model_size, accent=a.accent)
     for w in pron.warnings:
         print(f"⚠️  {w}")
 
@@ -289,6 +292,13 @@ def main():
     for x in pron.unused_overrides():
         print(f"⚠️  прочтение «{x['form']}» не применено: реплика в сцене {x['scene']} "
               f"изменилась — «{x['line'][:60]}»")
+    # Разметка видна числами: метка в одном слове выключает авто-акцентиацию хаба на
+    # всю сцену, и по логу должно быть видно, сколько слов ушло размеченными.
+    m = pron.mark_stats()
+    print(f"  ударения [{m['accent']}]: с меткой {m['marked']}, без метки {m['unmarked']}, "
+          f"отброшено {m['rejected']}")
+    for x in pron.bad_marks:
+        print(f"⚠️  ударение «{x['form']}» у слова «{x['text']}» отброшено — {x['why']}")
     print("→", out)
     if failed:
         raise SystemExit(f"сцены {failed}: движок не оставил паузы на стыках реплик. "
