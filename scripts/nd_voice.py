@@ -114,10 +114,10 @@ def cut_scene(samples, sr, lines_spoken, words):
     return cuts, heard, no_pause
 
 
-def voice_scene(text, voice, language, style, tries, seed):
+def voice_scene(text, voice, language, style, tries, seed, speed=1.0):
     """Озвучить сцену целиком → (байты, движок)."""
     return retry(lambda: nd_speak(text, voice=voice, language=language, style=style,
-                                  tries=1, seed=seed), tries)
+                                  tries=1, seed=seed, speed=speed), tries)
 
 
 def keep_previous(out_dir, si):
@@ -165,6 +165,8 @@ def main():
                     help="вернуть прошлый набор этих сцен (scene_NN.prev.wav) и перерезать его")
     ap.add_argument("--tries", type=int, default=5)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--speed", type=float, default=1.0,
+                    help="темп речи: 1.0 — как есть, больше — быстрее (укладывает ролик в хронометраж)")
     a = ap.parse_args()
 
     n = load_narration(a.narration)
@@ -180,7 +182,7 @@ def main():
     groups = scene_groups(n)
     os.makedirs(a.out_dir, exist_ok=True)
     print(f"{a.model or ('espeech-tts' if language == 'Russian' else 'qwen3-tts')} · {voice} · {language} · "
-          f"{len(groups)} сцен(ы) по одному вызову")
+          f"темп {a.speed:g} · {len(groups)} сцен(ы) по одному вызову")
 
     restore = set(a.restore_scenes or [])
     # Что озвучиваем. Важно: восстановление тоже задаёт выборку. Без этого «вернуть сцену 2»
@@ -236,12 +238,16 @@ def main():
             engine = "prev"
 
         result = None
-        attempts = 1 if kept else 2
+        # Три попытки: движок случаен, и сцена без паузы на стыке реплик — не
+        # поломка, а неудачный дубль. Раньше двух не хватало, и одна сцена роняла
+        # всю стадию.
+        attempts = 1 if kept else 3
         for attempt in range(1, attempts + 1):
             if kept:
                 data = kept
             else:
-                data, engine = voice_scene(text, voice, language, styles.get(beat, style), a.tries, a.seed)
+                data, engine = voice_scene(text, voice, language, styles.get(beat, style),
+                                           a.tries, a.seed, a.speed)
                 if attempt == 1:
                     keep_previous(a.out_dir, si)
             with open(os.path.join(a.out_dir, scene_name(si)), "wb") as f:
@@ -302,7 +308,7 @@ def main():
     print("→", out)
     if failed:
         raise SystemExit(f"сцены {failed}: движок не оставил паузы на стыках реплик. "
-                         f"Перезапустите озвучку этих сцен — движок случаен, обычно хватает дубля.")
+                         f"Переозвучите их — движок случаен, обычно хватает дубля.")
 
 
 if __name__ == "__main__":
