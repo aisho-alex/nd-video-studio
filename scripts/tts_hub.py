@@ -4,7 +4,7 @@
 Two engines behind one endpoint: `language=Russian` is voiced by ESpeech (F5 + RUAccent, correct
 stresses and homograph disambiguation), everything else by Qwen3-TTS. The engine is chosen by the
 language, so `model` is only sent when it differs from that default; the answer tells which one
-worked in the `X-TTS-Engine` header. Voices: vivian, serena, ono_anna, sohoe (f), dylan, ryan,
+worked in the `X-TTS-Engine` header. Voices: vivian, serena, ono_anna, sohee (f), dylan, ryan,
 aiden, uncle_fu (m). Style is free text in `instructions`, rate is `speed`.
 
   ND_API_KEY=sk-... python3 scripts/tts_hub.py projects/x/narration.json projects/x/audio/raw --voice ryan

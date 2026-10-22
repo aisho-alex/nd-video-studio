@@ -31,7 +31,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
-from ndv_common import (clip_name, envelope, load_narration, nd_speak, nd_transcribe,  # noqa: E402
+from ndv_common import (clip_name, envelope, load_narration, nd_json, nd_speak, nd_transcribe,  # noqa: E402
                         retry, scene_groups, scene_name, silence_spans, trim_silence,
                         wav_samples, write_wav)
 from pronounce import ACCENTS, Pronouncer  # noqa: E402
@@ -120,6 +120,22 @@ def voice_scene(text, voice, language, style, tries, seed, speed=1.0):
                                   tries=1, seed=seed, speed=speed), tries)
 
 
+def check_voice(voice):
+    """Спросить у хаба, какие голоса есть, и не начинать синтез с несуществующим.
+
+    Без этой проверки неизвестный голос умирал в середине минутной стадии с
+    «HTTP Error 400» и без пояснения. Список не пришёл — не мешаем: пусть решает движок.
+    """
+    try:
+        data = nd_json("/v1/audio/voices")
+    except Exception as exc:
+        print(f"⚠️  список голосов хаба недоступен ({exc}) — начинаю синтез как есть")
+        return
+    voices = [v for v in (data.get("voices") or []) if isinstance(v, str)]
+    if voices and voice not in voices:
+        raise SystemExit(f"голос «{voice}» хаб не знает: {', '.join(voices)}")
+
+
 def keep_previous(out_dir, si):
     """Отложить текущий набор сцены, прежде чем озвучить её заново.
 
@@ -183,6 +199,7 @@ def main():
     os.makedirs(a.out_dir, exist_ok=True)
     print(f"{a.model or ('espeech-tts' if language == 'Russian' else 'qwen3-tts')} · {voice} · {language} · "
           f"темп {a.speed:g} · {len(groups)} сцен(ы) по одному вызову")
+    check_voice(voice)
 
     restore = set(a.restore_scenes or [])
     # Что озвучиваем. Важно: восстановление тоже задаёт выборку. Без этого «вернуть сцену 2»

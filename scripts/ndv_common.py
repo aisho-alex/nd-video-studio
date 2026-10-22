@@ -14,6 +14,7 @@ import json
 import math
 import os
 import subprocess
+import urllib.error
 import urllib.request
 import wave
 
@@ -29,11 +30,33 @@ BUS_FADE_OUT = 0.030
 
 
 def http(url, body=None, headers=None, timeout=300):
-    """POST/GET bypassing HTTPS_PROXY: on the laptop it drops connections (Hub repo rule)."""
+    """POST/GET bypassing HTTPS_PROXY: on the laptop it drops connections (Hub repo rule).
+
+    Ошибку хаба показываем с его собственным пояснением: «Голос sohee не найден.
+    Доступные голоса: …». Без него в логе стадии остаётся «HTTP Error 400: Bad
+    Request», и человек гадает минуту, что именно он сломал. Тип исключения прежний
+    (HTTPError) — по нему отсеиваются 429 и 5xx для повтора.
+    """
     data = json.dumps(body).encode() if isinstance(body, (dict, list)) else body
     req = urllib.request.Request(url, data=data, headers=headers or {}, method="POST" if data is not None else "GET")
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    return opener.open(req, timeout=timeout)
+    try:
+        return opener.open(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            raw = e.read().decode("utf-8", "replace")
+            try:
+                detail = json.loads(raw).get("detail") or raw
+            except ValueError:
+                detail = raw
+        except Exception:
+            pass
+        detail = (detail or "").strip()[:400]
+        if detail:
+            raise urllib.error.HTTPError(e.url, e.code, f"{e.reason}: {detail}",
+                                         e.headers, None) from e
+        raise
 
 
 def run(args):
