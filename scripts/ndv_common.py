@@ -72,7 +72,14 @@ def duration(path):
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
         capture_output=True, text=True, check=True,
     ).stdout
-    return float(out)
+    try:
+        return float(out)
+    except ValueError:
+        # ffprobe на пустом или битом wav печатает «N/A» и выходит с кодом 0 —
+        # раньше это падало как «could not convert string to float: 'N/A'», из чего
+        # не было видно ни файла, ни причины.
+        raise SystemExit(f"{os.path.basename(path)}: файл не декодируется "
+                         f"(пустой или битый wav, {len(out.strip())} байт от ffprobe)")
 
 
 def load_narration(path):

@@ -92,12 +92,18 @@ def cut_scene(samples, sr, lines_spoken, words):
     `last_word[i]` — индекс последнего слова реплики, то есть её КОНЕЦ. Начало реплики
     получается из конца предыдущей, поэтому услышанное собирается по границам, а не
     начиная с last_word.
+
+    Границы держим в двух видах: сырые — для сравнений, округлённые — для отчёта.
+    Сравнивать округлённое с неокруглённым нельзя: две соседние границы, нашедшие одну
+    паузу, округлялись в одно и то же число, срез между ними выходил нулевой, и в
+    файл писался пустой wav. Падало это не здесь, а тремя шагами позже, на замере
+    длины, где выглядело как «N/A».
     """
     spans = silence_spans(envelope(samples, sr), sr, minlen=PAUSE_MIN)
     last_word = assign_lines(words, lines_spoken)
 
     start = 0
-    heard, cuts, no_pause = [], [0.0], []
+    heard, raw_cuts, cuts, no_pause = [], [0.0], [0.0], []
     for i in range(len(lines_spoken)):
         end = last_word.get(i)
         heard.append(" ".join(w for w, _, _ in words[start:(end + 1) if end is not None else None]))
@@ -105,11 +111,15 @@ def cut_scene(samples, sr, lines_spoken, words):
         if i == len(lines_spoken) - 1:
             break
         t_end = end and words[end][2]
-        at = snap(t_end or cuts[-1], spans)
-        if at is None or at <= cuts[-1]:
-            at = max(t_end or 0.0, cuts[-1] + 0.05)
+        at = snap(t_end or raw_cuts[-1], spans)
+        if at is None or at <= raw_cuts[-1]:
+            # Паузы на стыке нет: режем по концу слова. Сцена помечается битой и
+            # озвучивается заново — молча оставлять такой стык нельзя, на нём будет щелчок.
+            at = max(t_end or 0.0, raw_cuts[-1] + 0.05)
             no_pause.append(i)
+        raw_cuts.append(at)
         cuts.append(round(min(at, len(samples) / sr), 3))
+    raw_cuts.append(len(samples) / sr)
     cuts.append(round(len(samples) / sr, 3))
     return cuts, heard, no_pause
 
@@ -134,6 +144,22 @@ def check_voice(voice):
     voices = [v for v in (data.get("voices") or []) if isinstance(v, str)]
     if voices and voice not in voices:
         raise SystemExit(f"голос «{voice}» хаб не знает: {', '.join(voices)}")
+
+
+def drop_clips(out_dir, idx):
+    """Убрать клипы сцены, которая не получилась.
+
+    Оставленные файлы вредны: пустой wav роняет укладку в окна, а клип от прошлого
+    дубля — тихое расхождение между текстом и звуком. Лучше не оставить ничего, чем
+    оставить неправду.
+    """
+    for li in idx:
+        path = os.path.join(out_dir, clip_name(li))
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def keep_previous(out_dir, si):
@@ -276,6 +302,10 @@ def main():
             print(f"  сцена {si}: нет паузы на стыке {no_pause}, переозвучка ({attempt}/{attempts})")
         if result is None:
             failed.append(si)
+            # Сцена не удалась: её клипы убираем. Оставленные файлы — либо пустые,
+            # либо от прошлого дубля, и следующий шаг (укладка в окна) спотыкается о них
+            # вместо того, чтобы сказать, какую сцену переозвучить.
+            drop_clips(a.out_dir, idx)
             report.append({"scene": si, "lines": idx, "error": "нет паузы на стыке реплик",
                            "stress": occ})
             continue
@@ -295,10 +325,17 @@ def main():
                  "prev": os.path.exists(os.path.join(a.out_dir, scene_name(si, prev=True))),
                  "stress": occ,
                  "clips": []}
+        empty = []
         for k, li in enumerate(idx):
             a0, a1 = int(cuts[k] * sr), int(cuts[k + 1] * sr)
-            clip = trim_silence(samples[a0:a1], sr)
+            clip = trim_silence(samples[a0:a1], sr) if a1 > a0 else samples[:0]
             path = os.path.join(a.out_dir, clip_name(li))
+            if not len(clip):
+                # Срез пустой: границы схлопнулись (две реплики нашли одну паузу).
+                # Пустой wav писать нельзя — на замере длины он даёт «N/A», и стадия
+                # падает тремя шагами позже, в другом месте и с другим текстом.
+                empty.append(li)
+                continue
             write_wav(path, clip, sr)
             # сверяем с экранным текстом, а не с речевым: «эл-эл-эм» и «LLM» — одно и то же
             sim = SequenceMatcher(None, tokens(n["lines"][li]["text"]),
@@ -307,6 +344,15 @@ def main():
                                    "sim": round(sim, 3), "heard": heard[k]})
             flag = "OK " if sim >= 0.85 else "BAD"
             print(f"  сцена {si} строка {li:2} {flag} {sim:.2f} {len(clip) / sr:5.2f}s | {heard[k][:56]}")
+        if empty:
+            # Сцена битая: клипы этой сцены убираем, чтобы следующий шаг не спотыкался
+            # о них (пустой wav, а старая запись другой сцены — тоже не та).
+            drop_clips(a.out_dir, idx)
+            failed.append(si)
+            report.append({"scene": si, "lines": idx, "error": f"пустой срез у реплик {empty}",
+                           "stress": occ})
+            print(f"  сцена {si}: пустой срез у реплик {empty} — переозвучите сцену")
+            continue
         report.append(entry)
 
     out = os.path.join(os.path.dirname(a.out_dir) or ".", "speech_report.json")

@@ -70,6 +70,22 @@ def main():
     n = load_narration(a.narration)
     os.makedirs(a.out_dir, exist_ok=True)
     groups = scenes_of(n)
+    # Клипы проверяем до замера: пустой wav (схлопнувшиеся границы) и обрезанный
+    # файл дают «N/A» от ffprobe, и без этой проверки падение выглядит как «не
+    # превратилась строка в float» — из текста не видно, что переозвучивать.
+    missing = []
+    for i in range(len(n["lines"])):
+        path = os.path.join(a.raw_dir, clip_name(i))
+        if not os.path.exists(path):
+            missing.append((i, "нет файла"))
+        elif os.path.getsize(path) <= 44:      # 44 байта — заголовок wav без звука
+            missing.append((i, f"пустой ({os.path.getsize(path)} байт)"))
+    if missing:
+        scenes = sorted({i for i, _ in missing})
+        detail = ", ".join(f"реплика {i}: {why}" for i, why in missing[:5])
+        raise SystemExit(f"озвучка сцен {scenes} не удалась — клипов нет ({detail}). "
+                         f"Переозвучите эти сцены: стадия «Голос» убирает битые клипы, "
+                         f"а следующий прогон сделает их заново.")
     lengths, raw_dur = {}, {}
     for i in range(len(n["lines"])):
         raw_dur[i] = duration(os.path.join(a.raw_dir, clip_name(i)))
