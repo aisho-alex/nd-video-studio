@@ -393,20 +393,26 @@ class Pronouncer:
         return {"accent": self.accent, "marked": self.marked,
                 "unmarked": self.unmarked, "rejected": len(self.bad_marks)}
 
-    def scene(self, lines, stress=True):
+    def scene(self, lines, stress=True, sep=" "):
         """Текст сцены одной строкой: одна озвучка — один вызов движка."""
-        return self.scene_spoken(lines, stress=stress)[0]
+        return self.scene_spoken(lines, stress=stress, sep=sep)[0]
 
-    def scene_spoken(self, lines, line_ids=None, scene=None, stress=True):
+    def scene_spoken(self, lines, line_ids=None, scene=None, stress=True, sep=" "):
         """Текст сцены для движка и список спорных мест.
 
         Возвращает (speech, occurrences). В occurrences — по одной записи на омограф:
-        где он стоит в реплике, какое прочтение выбрано, какие ещё предлагает словарь
-        и чьё это решение — библиотеки или ваше.
+        где он стоит в реплике, какие ещё предлагает словарь и чьё это решение —
+        библиотеки или ваше.
 
         Контекст тут важен: омограф снимается соседними словами, и «Большая языковая
         модель» и «Большая книга» читаются по-разному. Поэтому библиотека смотрит на
         сцену целиком, а не на реплику по отдельности.
+
+        sep — чем склеиваются реплики. По умолчанию пробел, как раньше. Нужен иной
+        разделитель, чтобы на стыке реплик оставить паузу: движок не обязан её
+        оставить, а резать сцену надо в тишине. Разделитель переживает глоссарий и
+        RUAccent без вреда: и `WORD`, и `MARKED` его за слово не считают, так что
+        нумерация слов не едет.
         """
         line_ids = line_ids if line_ids is not None else list(range(len(lines)))
         # 1. Текст сцены: реплики склеены, ручной `speech` подставлен.
@@ -420,7 +426,8 @@ class Pronouncer:
             parts.append(text_k)
             for j in range(len(WORD.findall(text_k))):
                 owner.append((k, j))
-        joined = " ".join(parts)
+        joined = sep.join(parts)
+
         if not stress or self._acc is None:
             return (self._gloss(joined)[0], [])
 

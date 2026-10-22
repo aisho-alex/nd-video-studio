@@ -11,12 +11,15 @@
 
 - whisper-1 отдаёт тайминги слов; `difflib` раскладывает их по репликам и говорит, где
   кончается последнее слово реплики;
-- двигатель ставит между предложениями паузы по 0.75–0.93 с, а внутри реплики — 0.10–0.56 с,
-  то есть граница реплики почти всегда совпадает с самой длинной паузой рядом.
+- пауза на стыке реплик: у хаба движок ставит её сам (0.75–0.93 с), у SpeechKit — мы сами
+  (метка `sil<[200]>` в тексте сцены), потому что движок оставляет её не всегда.
 
-Граница берётся по середине ближайшей паузы, и реплика вырезается в тишине: стык в тишине
-не щёлкает по построению. Если паузы рядом нет — сцена переозвучивается один раз (движок
-случайный, второй дубль обычно ставит паузу), и если не вышло, стадия падает с кодом 3.
+Граница берётся в паузе, и реплика вырезается в тишине: стык в тишине
+не щёлкает по построению. Паузу на стыке ставим мы (см. tts_speechkit.with_pauses): движок оставляет
+её не всегда, и раньше сцена без паузы переозвучивалась до трёх раз, а потом стадия
+падала. Теперь стык без паузы — не поломка: режем по концу слова, отмечаем стык в
+отчёте и идём дальше.
+
 
   ND_API_KEY=sk-... python3 scripts/nd_voice.py projects/x/narration.json projects/x/audio/raw
   python3 scripts/nd_voice.py narration.json audio/raw --only 12 --voice uncle_fu
@@ -40,13 +43,17 @@ from ndv_common import (clip_name, envelope, load_narration, nd_json, nd_speak, 
                         retry, scene_groups, scene_name, silence_spans, trim_silence,
                         wav_samples, write_wav)
 from pronounce import ACCENTS, Pronouncer  # noqa: E402
-from tts_speechkit import GENERAL, LIVETTS, MODELS, SpeechKitError, speak as speechkit_speak  # noqa: E402
+from tts_speechkit import (GENERAL, LIVETTS, MODELS, SEP, SpeechKitError,  # noqa: E402
+                           with_pauses)
+from tts_speechkit import speak as speechkit_speak  # noqa: E402
 from difflib import SequenceMatcher  # noqa: E402
 
 LANGUAGES = {"ru": "Russian", "en": "English"}
 WORD = re.compile(r"\w+", re.UNICODE)
 PAUSE_MIN = 0.10        # короче — не пауза, а стык слогов внутри фразы
-SNAP_WINDOW = 0.5       # на каком расстоянии от конца слов ещё ищем паузу, секунды
+SNAP_WINDOW = 0.5       # на каком расстоянии от конца слова ещё ищем паузу, секунды
+TAIL = 0.06             # насколько конец слова может не дотягивать до конца паузы
+LEAD = 0.12            # насколько пауза может начаться позже конца слова, секунды
 
 
 def tokens(s):
@@ -84,20 +91,54 @@ def assign_lines(words, lines_spoken):
 
 
 def snap(t_end, spans):
-    """Граница реплики — середина ближайшей паузы. (граница, нашлась ли) — None, если нет."""
-    near = [s for s in spans if s[1] >= t_end - SNAP_WINDOW and s[0] <= t_end + SNAP_WINDOW]
-    if not near:
+    """Граница реплики — в паузе. None, если паузы рядом нет.
+
+    Выбор паузы — по тому, где она стоит относительно конца слова. Whisper отдаёт
+    конец слова вместе с хвостовой паузой: «вопросом,» — 6.05–7.14 при тишине
+    6.62–7.14, то есть конец слова это конец его паузы, а не конец звука слова.
+
+    Поэтому сначала идёт своя хвостовая пауза слова (та, что заканчивается на его
+    конце), потом пауза, начинающаяся сразу за словом, потом ближайшая рядом, и
+    только потом «плотный» рез по концу слова. Ближайшая нужна, когда конец слова
+    определён неверно: whisper дробит «чат-бот» на два слова, и тогда конец
+    реплики приходится на первое слово следующей.
+    """
+    if t_end is None:
         return None
-    best = min(near, key=lambda s: abs((s[0] + s[1]) / 2 - t_end))
-    return (best[0] + best[1]) / 2
+    # Хвостовая пауза слова: та, что заканчивается на его конце.
+    tail = [s for s in spans if s[0] <= t_end + TAIL and s[1] >= t_end - TAIL]
+    if tail:
+        best = max(tail, key=lambda s: s[1])
+        return (best[0] + best[1]) / 2
+    # Пауза сразу за словом: следующее слово начинается после неё, так что рез в
+    # этой тишине не откусит ни слова, ни следующей реплики.
+    lead = [s for s in spans if t_end - TAIL <= s[0] <= t_end + LEAD]
+    if lead:
+        best = min(lead, key=lambda s: s[0])
+        return (best[0] + best[1]) / 2
+    # Ближайшая пауза рядом — запасной путь. Нужен, когда конец слова определён
+    # неверно: whisper дробит «чат-бот» на два слова, и тогда конец реплики
+    # приходится на первое слово следующей. Раньше этот путь был единственным.
+    near = [s for s in spans if s[1] >= t_end - SNAP_WINDOW and s[0] <= t_end + SNAP_WINDOW]
+    if near:
+        best = min(near, key=lambda s: abs((s[0] + s[1]) / 2 - t_end))
+        return (best[0] + best[1]) / 2
+    return None
+
 
 
 def cut_scene(samples, sr, lines_spoken, words):
-    """Разрезать озвучку сцены на реплики. Возвращает (резы, что услышали в каждой, без паузы).
+    """Разрезать озвучку сцены на реплики.
+
+    Возвращает (резы, что услышали в каждой, стыки без паузы).
 
     `last_word[i]` — индекс последнего слова реплики, то есть её КОНЕЦ. Начало реплики
     получается из конца предыдущей, поэтому услышанное собирается по границам, а не
     начиная с last_word.
+
+    Стык без паузы — не поломка сцены. Паузу на стыке ставим мы (см. tts_speechkit),
+    но если движок её всё-таки не оставил, режем по концу слова и отмечаем стык:
+    ролик от этого не рассыпается, а сцена не выбрасывается и стадия не падает.
 
     Границы держим в двух видах: сырые — для сравнений, округлённые — для отчёта.
     Сравнивать округлённое с неокруглённым нельзя: две соседние границы, нашедшие одну
@@ -109,7 +150,7 @@ def cut_scene(samples, sr, lines_spoken, words):
     last_word = assign_lines(words, lines_spoken)
 
     start = 0
-    heard, raw_cuts, cuts, no_pause = [], [0.0], [0.0], []
+    heard, raw_cuts, cuts, tight = [], [0.0], [0.0], []
     for i in range(len(lines_spoken)):
         end = last_word.get(i)
         heard.append(" ".join(w for w, _, _ in words[start:(end + 1) if end is not None else None]))
@@ -119,15 +160,16 @@ def cut_scene(samples, sr, lines_spoken, words):
         t_end = end and words[end][2]
         at = snap(t_end or raw_cuts[-1], spans)
         if at is None or at <= raw_cuts[-1]:
-            # Паузы на стыке нет: режем по концу слова. Сцена помечается битой и
-            # озвучивается заново — молча оставлять такой стык нельзя, на нём будет щелчок.
+            # Паузы на стыке нет: режем по концу слова и отмечаем стык. Раньше здесь
+            # сцена помечалась битой и озвучивалась заново — движок паузу не оставлял
+            # не потому, что дубль неудачный, а потому, что не оставлял никогда.
             at = max(t_end or 0.0, raw_cuts[-1] + 0.05)
-            no_pause.append(i)
+            tight.append(i)
         raw_cuts.append(at)
         cuts.append(round(min(at, len(samples) / sr), 3))
     raw_cuts.append(len(samples) / sr)
     cuts.append(round(len(samples) / sr, 3))
-    return cuts, heard, no_pause
+    return cuts, heard, tight
 
 
 def voice_scene(text, voice, language, style, tries, seed, speed=1.0,
@@ -206,13 +248,13 @@ def process_scene(data, spoken, words=None):
 
     words — тайминги слов, если их отдал движок. Нет — распознаём речь сами.
 
-    (сэмплы, sr, резы, что услышали в каждой реплике, реплики без паузы)
+    (сэмплы, sr, резы, что услышали в каждой реплике, стыки без паузы)
     """
     samples, sr = wav_samples(data)
     if words is None:
         words = nd_transcribe(data, "whisper-1")["words"]
-    cuts, heard, no_pause = cut_scene(samples, sr, spoken, words)
-    return samples, sr, cuts, heard, no_pause
+    cuts, heard, tight = cut_scene(samples, sr, spoken, words)
+    return samples, sr, cuts, heard, tight
 
 
 def main():
@@ -298,7 +340,10 @@ def main():
         # Текст сцены и список спорных мест считаем всегда, даже если сцену не
         # озвучиваем: интерфейс показывает, где стоит омограф и какое прочтение
         # выбрано, и это не зависит от того, синтезировали мы её сейчас или нет.
-        text, occ = pron.scene_spoken([n["lines"][i] for i in idx], idx, si)
+        # Разделитель реплик — перевод строки: на стыке мы сами ставим паузу
+        # (движок оставляет её не всегда, а резать сцену надо в тишине).
+        text, occ = pron.scene_spoken([n["lines"][i] for i in idx], idx, si,
+                                      sep=SEP if a.tts_provider == "speechkit" else " ")
         spoken = [pron.line(n["lines"][i], stress=False) for i in idx]
         if si not in selected:
             kept = dict(previous.get(si) or {})
@@ -324,39 +369,25 @@ def main():
                 kept = f.read()
             engine = "prev"
 
-        result = None
-        # Три попытки: движок случаен, и сцена без паузы на стыке реплик — не
-        # поломка, а неудачный дубль. Раньше двух не хватало, и одна сцена роняла
-        # всю стадию.
-        attempts = 1 if kept else 3
-        for attempt in range(1, attempts + 1):
-            words = None
-            if kept:
-                data = kept
-            else:
-                data, engine, words = voice_scene(text, voice, language, styles.get(beat, style),
-                                                   a.tries, a.seed, a.speed,
-                                                   a.tts_provider, a.speechkit_model, a.role)
-                if attempt == 1:
-                    keep_previous(a.out_dir, si)
-            with open(os.path.join(a.out_dir, scene_name(si)), "wb") as f:
-                f.write(data)
-            samples, sr, cuts, heard, no_pause = process_scene(data, spoken, words)
-            if not no_pause:
-                result = (samples, sr, engine, cuts, heard)
-                break
-            print(f"  сцена {si}: нет паузы на стыке {no_pause}, переозвучка ({attempt}/{attempts})")
-        if result is None:
-            failed.append(si)
-            # Сцена не удалась: её клипы убираем. Оставленные файлы — либо пустые,
-            # либо от прошлого дубля, и следующий шаг (укладка в окна) спотыкается о них
-            # вместо того, чтобы сказать, какую сцену переозвучить.
-            drop_clips(a.out_dir, idx)
-            report.append({"scene": si, "lines": idx, "error": "нет паузы на стыке реплик",
-                           "stress": occ})
-            continue
+        # Синтез один: паузу на стыке ставим мы, и переозвучка её не создаёт. Раньше
+        # сцена без паузы переозвучивалась до трёх раз, а потом стадия падала — движок
+        # паузу не оставлял не потому, что дубль неудачный, а потому, что не оставлял
+        # никогда. Теперь стык без паузы — не поломка: режем по концу слова и идём дальше.
+        words = None
+        if kept:
+            data = kept
+        else:
+            speech = with_pauses(text) if a.tts_provider == "speechkit" else text
+            data, engine, words = voice_scene(speech, voice, language, styles.get(beat, style),
+                                               a.tries, a.seed, a.speed,
+                                               a.tts_provider, a.speechkit_model, a.role)
+            keep_previous(a.out_dir, si)
+        with open(os.path.join(a.out_dir, scene_name(si)), "wb") as f:
+            f.write(data)
+        samples, sr, cuts, heard, tight = process_scene(data, spoken, words)
+        if tight:
+            print(f"  сцена {si}: стык без паузы {tight} — режем по концу слова")
 
-        samples, sr, engine, cuts, heard = result
         if si in restore:
             # Восстановленный набор озвучен прежним текстом, а не тем, что сейчас в
             # нарративе. Отчёт должен описывать звук на диске — иначе «прочтение
@@ -365,11 +396,13 @@ def main():
             text = prev_entry.get("speech", text)
             occ = prev_entry.get("stress", occ)
         entry = {"scene": si, "lines": idx, "engine": engine, "beat": beat,
-                 "duration": round(len(samples) / sr, 2), "speech": text,
+                 "duration": round(len(samples) / sr, 2), "speech": text.replace(SEP, " "),
                  "restored": si in restore,
                  # есть ли что возвращать: интерфейс показывает кнопку отката
                  "prev": os.path.exists(os.path.join(a.out_dir, scene_name(si, prev=True))),
                  "stress": occ,
+                 # стыки без паузы: рез по концу слова, шов может быть с щелчком
+                 "tight": tight,
                  "clips": []}
         empty = []
         for k, li in enumerate(idx):
@@ -416,8 +449,7 @@ def main():
         print(f"⚠️  ударение «{x['form']}» у слова «{x['text']}» отброшено — {x['why']}")
     print("→", out)
     if failed:
-        raise SystemExit(f"сцены {failed}: движок не оставил паузы на стыках реплик. "
-                         f"Переозвучите их — движок случаен, обычно хватает дубля.")
+        raise SystemExit(f"сцены {failed}: пустой срез у реплик — переозвучите их.")
 
 
 if __name__ == "__main__":
