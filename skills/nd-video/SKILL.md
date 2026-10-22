@@ -45,6 +45,13 @@ read it before writing the first line of HTML.
      вместо того, чтобы сказать, какую сцену переозвучить.
    - `scripts/tts_hub.py` — старый путь «реплика на вызов». Оставлен для отладки; продом
      больше не используется.
+   - `scripts/tts_speechkit.py` — второй движок озвучки, Yandex SpeechKit (REST v3,
+     ключ `YANDEX_API_KEY`). Включается `--tts-provider speechkit`. Две модели:
+     `general` (обычные голоса: alena, alexander, anton, dasha, ermil, filipp, jane,
+     julia, kirill, lera, masha, marina, omazh, zahar) и `livetts` (премиум: irina,
+     sergey, sofia, vasily). Роль голоса — `--role` (casual, formal, sales, neutral,
+     friendly; набор ролей у голоса свой). Модель и голос задаёт приложение:
+     `--speechkit-model general|livetts`.
    - `scripts/tts_elevenlabs.py`: ElevenLabs `eleven_multilingual_v2`. The best Russian of the three;
      `voices` lists the account's voices, `speak` voices narration.json (neighbouring lines go as context).
 7. **Music** → `audio/music.mp3`:
@@ -69,11 +76,27 @@ Outbound commands (`gh`, `curl`, `npx`) run without the system proxy:
 |---|---|---|
 | gpt-audio, Lyria | `OPENROUTER_API_KEY` | not from a Russian IP: OpenRouter returns 403. Use a server outside Russia or `OPENROUTER_API_BASE` pointing at your egress |
 | hub TTS | `ND_API_KEY` (your own `sk-`) | anywhere |
+| Yandex SpeechKit | `YANDEX_API_KEY` (ключ Яндекс Клауда) | anywhere; REST v3, без gRPC |
 | ACE-Step | `ACESTEP_API_KEY` (if set) | ssh tunnel to the box, the API listens on 127.0.0.1 |
 
 Never print secrets or commit them (`.env` is in `.gitignore`).
 
 ## Voice: pitfalls
+
+- **У SpeechKit три особенности, на которых спотыкается наивный код** (`tts_speechkit.py`):
+  - голос, роль и темп читаются **только** из `hints`, и каждый объект `hints` несёт
+    **одно** поле. Поле на верхнем уровне запроса молча игнорируется, а голос с ролью
+    в одном объекте дают роль для голоса по умолчанию;
+  - один запрос — не больше 249 символов, дальше `unsafeMode: true` и сервис сам режет
+    текст по предложениям (интонация перезапускается на границе предложения — это цена
+    лимита, а не ошибка);
+  - звук приходит потоком, и в заголовке размер данных 0xFFFFFFFF: верь только
+    собственному заголовку, который пишешь сам.
+- **У премиум-голосов (livetts) нет таймингов слов и нет темпа**: движок отдаёт звук без
+  `wordTimings` и принимает только `speed = 1.0`. Реплики в этом случае режутся по
+  распознаванию (whisper-1), а темп подбирает укладка в хронометраж.
+- **Общий движок (general) говорит медленнее премиумного** — реплики выходят длиннее, и
+  укладка может не вписать их в окна (`TOO LONG`).
 
 - **Одна озвучка на сцену, а не на реплику** — главное правило звука. Тридцать шесть отдельных
   высказываний дают тридцать шесть перезапусков комнаты, громкости и интонации, и стык реплик
@@ -135,6 +158,11 @@ Never print secrets or commit them (`.env` is in `.gitignore`).
   не выжил — откат.
 - Ударения **нельзя проверить автоматически**: whisper ударение не слышит, а F0 умеет лишь
   показать, что знак встал на запрошенный слог. Эталон — словарь или ухо человека.
+- **У SpeechKit та же разметка.** `+` перед ударной гласной — соглашение и SpeechKit
+  (TTS-разметка), и нашего ruaccent, поэтому размеченный текст уходит движку как есть.
+  Проверено на реальных сценах: с метками распознавание даёт 1.00, «+» не слышно.
+  SpeechKit умеет ещё `sil<[500]>` (пауза), но в пайплайне она не нужна: паузы между
+  репликами ставит движок, а границы режутся по ним.
 
 ## Music: pitfalls
 

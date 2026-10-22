@@ -21,6 +21,11 @@
   ND_API_KEY=sk-... python3 scripts/nd_voice.py projects/x/narration.json projects/x/audio/raw
   python3 scripts/nd_voice.py narration.json audio/raw --only 12 --voice uncle_fu
   python3 scripts/nd_voice.py narration.json audio/raw --scenes 0 3
+
+Движок озвучки выбирается флагом --tts-provider: `hub` (по умолчанию) или `speechkit`
+(Yandex SpeechKit, ключ в YANDEX_API_KEY). У SpeechKit два движения: general
+(отдаёт тайминги слов — реплики режутся без распознавания) и livetts (премиум-голоса,
+таймингов не отдаёт, темп принимает только 1.0).
 """
 
 import argparse
@@ -35,6 +40,7 @@ from ndv_common import (clip_name, envelope, load_narration, nd_json, nd_speak, 
                         retry, scene_groups, scene_name, silence_spans, trim_silence,
                         wav_samples, write_wav)
 from pronounce import ACCENTS, Pronouncer  # noqa: E402
+from tts_speechkit import GENERAL, LIVETTS, MODELS, SpeechKitError, speak as speechkit_speak  # noqa: E402
 from difflib import SequenceMatcher  # noqa: E402
 
 LANGUAGES = {"ru": "Russian", "en": "English"}
@@ -124,10 +130,27 @@ def cut_scene(samples, sr, lines_spoken, words):
     return cuts, heard, no_pause
 
 
-def voice_scene(text, voice, language, style, tries, seed, speed=1.0):
-    """Озвучить сцену целиком → (байты, движок)."""
-    return retry(lambda: nd_speak(text, voice=voice, language=language, style=style,
-                                  tries=1, seed=seed, speed=speed), tries)
+def voice_scene(text, voice, language, style, tries, seed, speed=1.0,
+                provider="hub", model=GENERAL, role=None):
+    """Озвучить сцену целиком → (байты, движок, тайминги слов или None).
+
+    Тайминги слов отдаёт только SpeechKit общего движка: он сам знает, где какое
+    слово прозвучало, и резать реплики по ним точнее, чем по распознаванию. У
+    премиум-движка (livetts) таймингов нет вовсе, и у хаба тоже: там нарезку
+    делает whisper.
+    """
+    if provider == "speechkit":
+        def call():
+            try:
+                data, words = speechkit_speak(text, voice, model, role, speed)
+            except SpeechKitError as exc:
+                # Отказ движка не временный: второй дубль упал бы так же, только дороже.
+                raise SystemExit(f"SpeechKit: {exc}")
+            return data, f"speechkit {model}", (words or None)
+        return retry(call, tries)
+    data, engine = retry(lambda: nd_speak(text, voice=voice, language=language, style=style,
+                                          tries=1, seed=seed, speed=speed), tries)
+    return data, engine, None
 
 
 def check_voice(voice):
@@ -178,13 +201,17 @@ def keep_previous(out_dir, si):
     return True
 
 
-def process_scene(data, spoken):
+def process_scene(data, spoken, words=None):
     """Нарезка озвучки сцены на реплики. Работает и для свежего синтеза, и для отложенного.
+
+    words — тайминги слов, если их отдал движок. Нет — распознаём речь сами.
 
     (сэмплы, sr, резы, что услышали в каждой реплике, реплики без паузы)
     """
     samples, sr = wav_samples(data)
-    cuts, heard, no_pause = cut_scene(samples, sr, spoken, nd_transcribe(data, "whisper-1")["words"])
+    if words is None:
+        words = nd_transcribe(data, "whisper-1")["words"]
+    cuts, heard, no_pause = cut_scene(samples, sr, spoken, words)
     return samples, sr, cuts, heard, no_pause
 
 
@@ -209,6 +236,12 @@ def main():
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--speed", type=float, default=1.0,
                     help="темп речи: 1.0 — как есть, больше — быстрее (укладывает ролик в хронометраж)")
+    ap.add_argument("--tts-provider", default="hub", choices=("hub", "speechkit"),
+                    help="движок озвучки: хаб (по умолчанию) или SpeechKit Яндекса")
+    ap.add_argument("--speechkit-model", default=GENERAL, choices=MODELS,
+                    help="модель SpeechKit: general (обычные голоса) или livetts (премиум)")
+    ap.add_argument("--role", default=None,
+                    help="роль голоса SpeechKit (casual, formal, sales, neutral, friendly)")
     a = ap.parse_args()
 
     n = load_narration(a.narration)
@@ -223,9 +256,20 @@ def main():
 
     groups = scene_groups(n)
     os.makedirs(a.out_dir, exist_ok=True)
-    print(f"{a.model or ('espeech-tts' if language == 'Russian' else 'qwen3-tts')} · {voice} · {language} · "
-          f"темп {a.speed:g} · {len(groups)} сцен(ы) по одному вызову")
-    check_voice(voice)
+    if a.tts_provider == "speechkit":
+        # Темп у премиум-движка не принимается: показываем правду, а не просим
+        # человека гадать, почему ролик не ускоряется.
+        speed = a.speed if a.speechkit_model == GENERAL else 1.0
+        print(f"speechkit {a.speechkit_model} · {voice}"
+              f"{' · ' + a.role if a.role else ''} · {language} · "
+              f"темп {speed:g} · {len(groups)} сцен(ы) по одному вызову")
+        if speed != a.speed:
+            print("⚠️  премиум-голос движок не ускоряет (там только 1.0) — "
+                  "темп в хронометраж подберёт fit_narration")
+    else:
+        print(f"{a.model or ('espeech-tts' if language == 'Russian' else 'qwen3-tts')} · {voice} · {language} · "
+              f"темп {a.speed:g} · {len(groups)} сцен(ы) по одному вызову")
+        check_voice(voice)
 
     restore = set(a.restore_scenes or [])
     # Что озвучиваем. Важно: восстановление тоже задаёт выборку. Без этого «вернуть сцену 2»
@@ -286,16 +330,18 @@ def main():
         # всю стадию.
         attempts = 1 if kept else 3
         for attempt in range(1, attempts + 1):
+            words = None
             if kept:
                 data = kept
             else:
-                data, engine = voice_scene(text, voice, language, styles.get(beat, style),
-                                           a.tries, a.seed, a.speed)
+                data, engine, words = voice_scene(text, voice, language, styles.get(beat, style),
+                                                   a.tries, a.seed, a.speed,
+                                                   a.tts_provider, a.speechkit_model, a.role)
                 if attempt == 1:
                     keep_previous(a.out_dir, si)
             with open(os.path.join(a.out_dir, scene_name(si)), "wb") as f:
                 f.write(data)
-            samples, sr, cuts, heard, no_pause = process_scene(data, spoken)
+            samples, sr, cuts, heard, no_pause = process_scene(data, spoken, words)
             if not no_pause:
                 result = (samples, sr, engine, cuts, heard)
                 break
